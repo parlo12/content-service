@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -88,39 +90,54 @@ func generateSoundEffect(text string) (string, error) {
 	return filePath, nil
 }
 
-// mergeAudio uses FFmpeg to merge the two audio files (the TTS audio and sound effects) into one file.
+// mergeAudio uses FFmpeg to overlay (mix) the TTS audio with the sound effects.
+// It first retrieves the duration of the TTS audio via ffprobe, then loops the sound
+// effects until it matches the TTS duration, and finally overlays the two audio streams.
 func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, error) {
+	// Get the duration of the TTS audio file using ffprobe.
+	ffprobeCmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1", ttsAudioPath)
+	ffprobeOutput, err := ffprobeCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get TTS duration: %w", err)
+	}
+	durationStr := strings.TrimSpace(string(ffprobeOutput))
+	ttsDuration, err := strconv.ParseFloat(durationStr, 64)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse TTS duration: %w", err)
+	}
+	log.Printf("TTS duration: %.2f seconds", ttsDuration)
+
 	mergedAudioPath := "./audio/merged_output.mp3"
 
-	// Build the FFmpeg command:
-	// - "-y" to overwrite the output file if it exists.
-	// - "-i" specifies input files.
-	// - The filter_complex amerge filter merges the two audio streams.
-	// - "-map" picks the merged audio output.
-	// - "-ac 2" sets the output channels to 2.
-	cmd := exec.Command("ffmpeg", "-y",
+	// Construct the FFmpeg command.
+	// This command uses -stream_loop to loop the sound effects input indefinitely,
+	// then trims it to the TTS duration using atrim, and finally overlays the two audio files with amix.
+	// The filter_complex here does the following:
+	//   [1] - the sound effects file is looped and trimmed to the TTS duration.
+	//   [0] - the TTS file.
+	//   amix=inputs=2:duration=first overlays them so that the TTS file's duration is preserved.
+	filterComplex := fmt.Sprintf("[1]atrim=duration=%.2f,aloop=loop=-1:size=0[sfx];[0][sfx]amix=inputs=2:duration=first:dropout_transition=2", ttsDuration)
+
+	ffmpegCmd := exec.Command("ffmpeg", "-y",
 		"-i", ttsAudioPath,
-		"-i", soundEffectsAudioPath,
-		"-filter_complex", "[0:a][1:a]amerge=inputs=2[a]",
-		"-map", "[a]",
-		"-ac", "2",
+		"-stream_loop", "-1", "-i", soundEffectsAudioPath,
+		"-filter_complex", filterComplex,
 		mergedAudioPath)
 
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	// Run the FFmpeg command.
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("ffmpeg error: %v, details: %s", err, stderr.String())
+	// Execute the FFmpeg command.
+	ffmpegOutput, err := ffmpegCmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ffmpeg command failed: %v, output: %s", err, string(ffmpegOutput))
 	}
 
 	log.Printf("Merging TTS audio '%s' with sound effects '%s' into '%s'", ttsAudioPath, soundEffectsAudioPath, mergedAudioPath)
 	return mergedAudioPath, nil
 }
 
-// processSoundEffectsAndMerge generates sound effects based on an overall prompt and then merges
-// these effects with the TTS audio for the given book.
-// Note: The functions generateOverallSoundPrompt and updateBookStatus should be defined once elsewhere in your project.
+// processSoundEffectsAndMerge generates sound effects based on an overall prompt (generated from book text)
+// and then merges these effects with the TTS audio for the given book.
+// Note: The functions generateOverallSoundPrompt and updateBookStatus are assumed to be defined elsewhere.
 func processSoundEffectsAndMerge(book Book) {
 	// Generate an overall sound prompt from the book's text.
 	overallPrompt, err := generateOverallSoundPrompt(book.FilePath)
@@ -140,7 +157,7 @@ func processSoundEffectsAndMerge(book Book) {
 	}
 	log.Printf("Sound effects file generated for book ID %d: %s", book.ID, soundEffectsFilePath)
 
-	// Now merge the TTS audio and the generated sound effects using FFmpeg.
+	// Merge the TTS audio and the generated sound effects.
 	mergedAudioPath, err := mergeAudio(book.AudioPath, soundEffectsFilePath)
 	if err != nil {
 		log.Printf("Error merging audio for book ID %d: %v", book.ID, err)
