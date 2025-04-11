@@ -16,7 +16,8 @@ import (
 
 // Global variables
 var db *gorm.DB
-var jwtSecretKey = []byte("50188fc5f24541a92eef207c8dbf9eb3f4bdcba50fe079f6ff5bf4edcda48123") // Replace with your generated secret or use an env var.
+
+var jwtSecretKey = []byte(getEnv("JWT_SECRET", "defaultSecrete")) // Replace with your generated secret or use an env var.
 
 // Allowed categories for validation
 var allowedCategories = []string{"Fiction", "Non-Fiction"}
@@ -57,6 +58,11 @@ func main() {
 	{
 		authorized.POST("/books", createBookHandler)
 		authorized.GET("/books", listBooksHandler)
+		// added a file upload handler for books.
+		authorized.POST("/books/upload", uploadBookFileHandler)
+		// authorized.GET("/books/:title", getBookHandler) // Uncomment if you need to fetch a specific book.
+		// added a streaming handler for books.
+		authorized.GET("/books/stream/:id", streamBookAudioHandler)
 	}
 
 	// Use PORT env var if set; default to 8082.
@@ -71,11 +77,11 @@ func main() {
 // setupDatabase connects to PostgreSQL and auto migrates the Book model.
 func setupDatabase() {
 	// Read database configuration.
-	dbHost := getEnv("DB_HOST", "postgres")
-	dbUser := getEnv("DB_USER", "rolf")
-	dbPassword := getEnv("DB_PASSWORD", "newpassword")
-	dbName := getEnv("DB_NAME", "streaming_db")
-	dbPort := getEnv("DB_PORT", "5432")
+	dbHost := getEnv("DB_HOST", "")
+	dbUser := getEnv("DB_USER", "")
+	dbPassword := getEnv("DB_PASSWORD", "")
+	dbName := getEnv("DB_NAME", "")
+	dbPort := getEnv("DB_PORT", "")
 
 	dsn := "host=" + dbHost +
 		" user=" + dbUser +
