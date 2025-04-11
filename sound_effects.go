@@ -92,7 +92,8 @@ func generateSoundEffect(text string) (string, error) {
 
 // mergeAudio uses FFmpeg to overlay (mix) the TTS audio with the sound effects.
 // It first retrieves the duration of the TTS audio via ffprobe, then loops the sound
-// effects until it matches the TTS duration, and finally overlays the two audio streams.
+// effects until it matches the TTS duration, and finally overlays the two audio streams,
+// encoding the output in Opus inside an Ogg container.
 func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, error) {
 	// Get the duration of the TTS audio file using ffprobe.
 	ffprobeCmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -108,24 +109,28 @@ func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, erro
 	}
 	log.Printf("TTS duration: %.2f seconds", ttsDuration)
 
-	mergedAudioPath := "./audio/merged_output.mp3"
+	// Set the merged output file path with an .ogg extension.
+	mergedAudioPath := "./audio/merged_output.ogg"
 
-	// Construct the FFmpeg command.
-	// This command uses -stream_loop to loop the sound effects input indefinitely,
-	// then trims it to the TTS duration using atrim, and finally overlays the two audio files with amix.
-	// The filter_complex here does the following:
-	//   [1] - the sound effects file is looped and trimmed to the TTS duration.
-	//   [0] - the TTS file.
-	//   amix=inputs=2:duration=first overlays them so that the TTS file's duration is preserved.
+	// Construct the FFmpeg filter_complex string.
+	// It loops (using -stream_loop -1) and trims the sound effects to match the TTS duration,
+	// then overlays them using amix while preserving the TTS duration.
 	filterComplex := fmt.Sprintf("[1]atrim=duration=%.2f,aloop=loop=-1:size=0[sfx];[0][sfx]amix=inputs=2:duration=first:dropout_transition=2", ttsDuration)
 
-	ffmpegCmd := exec.Command("ffmpeg", "-y",
+	// Construct the FFmpeg command arguments.
+	// - "-c:a libopus" ensures that audio is encoded with the Opus codec.
+	// - "-b:a 64k" sets the audio bitrate (adjust as needed).
+	ffmpegArgs := []string{
+		"-y",
 		"-i", ttsAudioPath,
 		"-stream_loop", "-1", "-i", soundEffectsAudioPath,
 		"-filter_complex", filterComplex,
-		mergedAudioPath)
+		"-c:a", "libopus",
+		"-b:a", "64k",
+		mergedAudioPath,
+	}
 
-	// Execute the FFmpeg command.
+	ffmpegCmd := exec.Command("ffmpeg", ffmpegArgs...)
 	ffmpegOutput, err := ffmpegCmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("ffmpeg command failed: %v, output: %s", err, string(ffmpegOutput))
