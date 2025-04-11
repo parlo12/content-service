@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"time"
 )
 
@@ -23,7 +24,8 @@ type SoundEffectRequest struct {
 }
 
 // generateSoundEffect calls ElevenLabs' sound effects endpoint using the provided text.
-// It returns the response as a string—typically, you would expect an MP3 file or base64 encoded audio.
+// Instead of returning a string, this function writes the binary MP3 response to a file
+// and returns the file path.
 func generateSoundEffect(text string) (string, error) {
 	apiKey := os.Getenv("XI_API_KEY")
 	if apiKey == "" {
@@ -49,8 +51,9 @@ func generateSoundEffect(text string) (string, error) {
 	req.Header.Add("xi-api-key", apiKey)
 	req.Header.Add("Content-Type", "application/json")
 
-	// Execute the request.
-	resp, err := http.DefaultClient.Do(req)
+	// Set up an HTTP client with a timeout.
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("sound effects API request error: %w", err)
 	}
@@ -62,54 +65,90 @@ func generateSoundEffect(text string) (string, error) {
 		return "", fmt.Errorf("sound effects API returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	bodyBytes, err := io.ReadAll(resp.Body)
+	// Read the binary response.
+	soundData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("failed to read sound effects API response: %w", err)
 	}
 
-	return string(bodyBytes), nil
+	// Ensure the audio directory exists.
+	if err := os.MkdirAll("./audio", 0755); err != nil {
+		return "", fmt.Errorf("failed to create audio directory: %w", err)
+	}
+
+	// Generate a unique filename for the sound effect.
+	filename := fmt.Sprintf("sound_effect_%d.mp3", time.Now().Unix())
+	filePath := "./audio/" + filename
+
+	// Write the binary data to the file.
+	if err := os.WriteFile(filePath, soundData, 0644); err != nil {
+		return "", fmt.Errorf("failed to write sound effects file: %w", err)
+	}
+
+	return filePath, nil
 }
 
-// mergeAudio simulates merging two audio streams (the TTS voice and sound effects) into one file.
-// In production, you would use an audio processing library to mix the files.
+// mergeAudio uses FFmpeg to merge the two audio files (the TTS audio and sound effects) into one file.
 func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, error) {
-	// Simulate a processing delay.
-	time.Sleep(3 * time.Second)
-	// For this example, we'll simulate that the merged audio is saved to a new file.
 	mergedAudioPath := "./audio/merged_output.mp3"
+
+	// Build the FFmpeg command:
+	// - "-y" to overwrite the output file if it exists.
+	// - "-i" specifies input files.
+	// - The filter_complex amerge filter merges the two audio streams.
+	// - "-map" picks the merged audio output.
+	// - "-ac 2" sets the output channels to 2.
+	cmd := exec.Command("ffmpeg", "-y",
+		"-i", ttsAudioPath,
+		"-i", soundEffectsAudioPath,
+		"-filter_complex", "[0:a][1:a]amerge=inputs=2[a]",
+		"-map", "[a]",
+		"-ac", "2",
+		mergedAudioPath)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	// Run the FFmpeg command.
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffmpeg error: %v, details: %s", err, stderr.String())
+	}
+
 	log.Printf("Merging TTS audio '%s' with sound effects '%s' into '%s'", ttsAudioPath, soundEffectsAudioPath, mergedAudioPath)
-	// This is just a placeholder; you'll later replace it with actual audio merging logic.
 	return mergedAudioPath, nil
 }
 
-// processSoundEffectsAndMerge generates sound effects using ElevenLabs and then merges them with the TTS audio.
-// Call this function after TTS conversion has been completed (i.e. after processBookConversion).
+// processSoundEffectsAndMerge generates sound effects based on an overall prompt and then merges
+// these effects with the TTS audio for the given book.
+// Note: The functions generateOverallSoundPrompt and updateBookStatus should be defined once elsewhere in your project.
 func processSoundEffectsAndMerge(book Book) {
-	// Define the text prompt for sound effects. This can be generated dynamically based on book context.
-	soundEffectText := "Spacious braam suitable for high-impact movie trailer moments"
+	// Generate an overall sound prompt from the book's text.
+	overallPrompt, err := generateOverallSoundPrompt(book.FilePath)
+	if err != nil {
+		log.Printf("Error generating overall sound prompt for book ID %d: %v", book.ID, err)
+		updateBookStatus(book.ID, "failed")
+		return
+	}
+	log.Printf("Generated overall sound prompt for book ID %d: %s", book.ID, overallPrompt)
 
-	// Call ElevenLabs' sound effects endpoint.
-	soundEffectsResponse, err := generateSoundEffect(soundEffectText)
+	// Generate sound effects using the overall prompt.
+	soundEffectsFilePath, err := generateSoundEffect(overallPrompt)
 	if err != nil {
 		log.Printf("Error generating sound effects for book ID %d: %v", book.ID, err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
-	log.Printf("Sound effects response for book ID %d: %s", book.ID, soundEffectsResponse)
+	log.Printf("Sound effects file generated for book ID %d: %s", book.ID, soundEffectsFilePath)
 
-	// In a real implementation, the response would include audio data.
-	// For this simulation, assume a dummy sound effects audio file path.
-	soundEffectsAudioPath := "./audio/sound_effects_dummy.mp3"
-
-	// Now merge the TTS (voice) audio and the sound effects audio.
-	mergedAudioPath, err := mergeAudio(book.AudioPath, soundEffectsAudioPath)
+	// Now merge the TTS audio and the generated sound effects using FFmpeg.
+	mergedAudioPath, err := mergeAudio(book.AudioPath, soundEffectsFilePath)
 	if err != nil {
 		log.Printf("Error merging audio for book ID %d: %v", book.ID, err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
 
-	// Update the Book record with the merged audio path.
+	// Update the Book record with the new merged audio file path.
 	book.AudioPath = mergedAudioPath
 	if err := db.Save(&book).Error; err != nil {
 		log.Printf("Error updating book record after merging audio for book ID %d: %v", book.ID, err)

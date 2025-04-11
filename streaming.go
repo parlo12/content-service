@@ -36,6 +36,8 @@ func streamBookAudioHandler(c *gin.Context) {
 		return
 	}
 
+	// Set the Content-Type header so clients know it's an MP3 file.
+	c.Header("Content-Type", "audio/mpeg")
 	// Stream the file to the client.
 	c.File(book.AudioPath)
 }

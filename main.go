@@ -17,7 +17,7 @@ import (
 // Global variables
 var db *gorm.DB
 
-var jwtSecretKey = []byte(getEnv("JWT_SECRET", "defaultSecrete")) // Replace with your generated secret or use an env var.
+var jwtSecretKey = []byte(getEnv("JWT_SECRET", "defaultSecrete")) // Use an env var in production.
 
 // Allowed categories for validation
 var allowedCategories = []string{"Fiction", "Non-Fiction"}
@@ -28,9 +28,9 @@ type Book struct {
 	Title     string `gorm:"not null"`
 	Author    string
 	FilePath  string // Local storage file path.
-	AudioPath string // Path/URL of the generated audio.
+	AudioPath string // Path/URL of the generated (merged) audio.
 	Status    string `gorm:"default:'pending'"`
-	Category  string `gorm:"not null;index"` // Index for faster queries.
+	Category  string `gorm:"not null;index"`
 	Genre     string `gorm:"index"`
 	UserID    uint   `gorm:"index"`
 	CreatedAt time.Time
@@ -40,9 +40,9 @@ type Book struct {
 // BookRequest defines the expected JSON structure for creating a book.
 type BookRequest struct {
 	Title    string `json:"title" binding:"required"`
-	Author   string `json:"author"` // Optional.
+	Author   string `json:"author"`
 	Category string `json:"category" binding:"required"`
-	Genre    string `json:"genre"` // Genre can be optional.
+	Genre    string `json:"genre"`
 }
 
 func main() {
@@ -52,20 +52,17 @@ func main() {
 	// Initialize Gin router.
 	router := gin.Default()
 
-	// Protected routes group. (Assuming auth middleware is similar to auth-service.)
+	// Protected routes group.
 	authorized := router.Group("/user")
 	authorized.Use(authMiddleware())
 	{
 		authorized.POST("/books", createBookHandler)
 		authorized.GET("/books", listBooksHandler)
-		// added a file upload handler for books.
 		authorized.POST("/books/upload", uploadBookFileHandler)
-		// authorized.GET("/books/:title", getBookHandler) // Uncomment if you need to fetch a specific book.
-		// added a streaming handler for books.
 		authorized.GET("/books/stream/:id", streamBookAudioHandler)
 	}
 
-	// Use PORT env var if set; default to 8082.
+	// Use PORT env var if set; default to 8083.
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8083"
@@ -74,7 +71,7 @@ func main() {
 	router.Run(":" + port)
 }
 
-// setupDatabase connects to PostgreSQL and auto migrates the Book model.
+// setupDatabase connects to PostgreSQL and automigrates the Book model.
 func setupDatabase() {
 	// Read database configuration.
 	dbHost := getEnv("DB_HOST", "")
@@ -96,14 +93,13 @@ func setupDatabase() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	// Auto migrate the Book model.
+	// Automigrate the Book model.
 	if err := db.AutoMigrate(&Book{}); err != nil {
 		log.Fatalf("AutoMigrate failed: %v", err)
 	}
 	log.Println("Database connected and migrated successfully")
 }
 
-// createBookHandler handles POST /user/books for creating a new book record.
 func createBookHandler(c *gin.Context) {
 	var req BookRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -112,13 +108,11 @@ func createBookHandler(c *gin.Context) {
 		return
 	}
 
-	// Validate that the category is allowed.
 	if !isValidCategory(req.Category) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid category", "allowed_categories": allowedCategories})
 		return
 	}
 
-	// Retrieve the authenticated user's ID from JWT claims.
 	claims, exists := c.Get("claims")
 	if !exists {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication claims missing"})
@@ -136,7 +130,6 @@ func createBookHandler(c *gin.Context) {
 	}
 	userID := uint(userIDFloat)
 
-	// Create the new book.
 	book := Book{
 		Title:    req.Title,
 		Author:   req.Author,
@@ -153,7 +146,6 @@ func createBookHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Book saved", "book": book})
 }
 
-// listBooksHandler handles GET /user/books to list books for the current user.
 func listBooksHandler(c *gin.Context) {
 	claims, exists := c.Get("claims")
 	if !exists {
@@ -172,7 +164,6 @@ func listBooksHandler(c *gin.Context) {
 	}
 	userID := uint(userIDFloat)
 
-	// Optional filtering.
 	category := c.Query("category")
 	genre := c.Query("genre")
 
@@ -192,7 +183,6 @@ func listBooksHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"books": books})
 }
 
-// isValidCategory checks if the submitted category is allowed.
 func isValidCategory(category string) bool {
 	for _, allowed := range allowedCategories {
 		if strings.EqualFold(category, allowed) {
@@ -202,7 +192,6 @@ func isValidCategory(category string) bool {
 	return false
 }
 
-// authMiddleware validates JWT tokens in the request.
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenString, err := extractToken(c.GetHeader("Authorization"))
@@ -225,7 +214,6 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
-// extractToken expects the Authorization header to be "Bearer <token>" and returns the token part.
 func extractToken(authHeader string) (string, error) {
 	if authHeader == "" {
 		return "", errors.New("Authorization header missing")
@@ -237,7 +225,6 @@ func extractToken(authHeader string) (string, error) {
 	return parts[1], nil
 }
 
-// getEnv returns the environment variable value or a fallback.
 func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
 		return value
