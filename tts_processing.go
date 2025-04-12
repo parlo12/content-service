@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,45 +12,52 @@ import (
 	"time"
 )
 
-const elevenLabsTTSURLTemplate = "https://api.elevenlabs.io/v1/text-to-speech/%s/stream/with-timestamps?output_format=mp3_44100_128"
+// openaiTTSEndpoint is the endpoint for generating audio from text using OpenAI's TTS.
+const openaiTTSEndpoint = "https://api.openai.com/v1/audio/speech"
 
-type TTSRequest struct {
-	Text    string `json:"text"`
-	ModelID string `json:"model_id,omitempty"`
+// TTSPayload represents the JSON payload for the OpenAI TTS endpoint.
+type TTSPayload struct {
+	Input          string  `json:"input"`                     // The text to generate audio for.
+	Model          string  `json:"model"`                     // One of "tts-1", "tts-1-hd", or "gpt-4o-mini-tts".
+	Voice          string  `json:"voice"`                     // One of "alloy", "ash", "ballad", "coral", "echo", "fable", "onyx", "nova", "sage", "shimmer", or "verse".
+	Instructions   string  `json:"instructions,omitempty"`    // Optional instructions to control speech (e.g., tone, pace).
+	ResponseFormat string  `json:"response_format,omitempty"` // Desired output format: "mp3", "opus", "aac", "flac", "wav", or "pcm". Default is "mp3".
+	Speed          float64 `json:"speed,omitempty"`           // Playback speed (0.25 - 4.0, default is 1.0).
 }
 
-type TTSResponse struct {
-	AudioBase64 string `json:"audio_base64"`
-}
-
+// convertTextToAudio sends a request to the OpenAI Speech API to generate audio
+// from the input text and saves it to a file. It returns the file path.
 func convertTextToAudio(text string) (string, error) {
-	voiceID := os.Getenv("ELEVENLABS_VOICE_ID")
-	if voiceID == "" {
-		return "", errors.New("ELEVENLABS_VOICE_ID environment variable not set")
-	}
-	apiKey := os.Getenv("XI_API_KEY")
+	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
-		return "", errors.New("XI_API_KEY environment variable not set")
+		return "", errors.New("OPENAI_API_KEY environment variable not set")
 	}
 
-	url := fmt.Sprintf(elevenLabsTTSURLTemplate, voiceID)
-	payload := TTSRequest{
-		Text:    text,
-		ModelID: "eleven_multilingual_v2",
+	// Prepare the payload using the new OpenAI Speech API specification.
+	payload := TTSPayload{
+		Input:          text,
+		Model:          "gpt-4o-mini-tts", // or "tts-1", "tts-1-hd" depending on your quality/latency needs.
+		Voice:          "alloy",           // Choose your preferred voice.
+		ResponseFormat: "mp3",             // Use MP3 for a good balance of quality and file size.
+		Speed:          1.0,
+		// Instructions can be added if needed, e.g., "Speak in a cheerful tone."
 	}
+
 	reqBody, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal TTS payload: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(reqBody))
+	req, err := http.NewRequest("POST", openaiTTSEndpoint, bytes.NewReader(reqBody))
 	if err != nil {
 		return "", fmt.Errorf("failed to create TTS request: %w", err)
 	}
-	req.Header.Add("xi-api-key", apiKey)
+	// Set the Authorization header with your API key.
+	req.Header.Add("Authorization", "Bearer "+apiKey)
 	req.Header.Add("Content-Type", "application/json")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("TTS API request error: %w", err)
 	}
@@ -63,41 +68,35 @@ func convertTextToAudio(text string) (string, error) {
 		return "", fmt.Errorf("TTS API returned status %d: %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	var combinedAudio bytes.Buffer
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		var chunk TTSResponse
-		if err := json.Unmarshal([]byte(line), &chunk); err != nil {
-			log.Printf("Error parsing a chunk of TTS response: %v", err)
-			continue
-		}
-		audioChunk, err := base64.StdEncoding.DecodeString(chunk.AudioBase64)
-		if err != nil {
-			log.Printf("Error decoding audio chunk: %v", err)
-			continue
-		}
-		combinedAudio.Write(audioChunk)
-	}
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("error reading TTS streaming response: %w", err)
-	}
-
+	// Ensure the audio directory exists.
 	if err := os.MkdirAll("./audio", 0755); err != nil {
 		return "", fmt.Errorf("failed to create audio directory: %w", err)
 	}
 
+	// Generate a unique filename.
 	audioFileName := fmt.Sprintf("audio_%d.mp3", time.Now().Unix())
 	audioPath := "./audio/" + audioFileName
 
-	if err := os.WriteFile(audioPath, combinedAudio.Bytes(), 0644); err != nil {
-		return "", fmt.Errorf("failed to write audio file: %w", err)
+	outFile, err := os.Create(audioPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create audio file: %w", err)
+	}
+	defer outFile.Close()
+
+	// Stream the entire binary response into the file.
+	_, err = io.Copy(outFile, resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to write audio to file: %w", err)
 	}
 
 	return audioPath, nil
 }
 
+// processBookConversion processes a book by reading its text,
+// generating TTS audio using the OpenAI Speech API, updating the database,
+// and then triggering sound effects merging asynchronously.
 func processBookConversion(book Book) {
+	// Read the text from the book file (assuming it's a TXT file).
 	contentBytes, err := os.ReadFile(book.FilePath)
 	if err != nil {
 		log.Printf("Error reading file for book ID %d: %v", book.ID, err)
@@ -106,6 +105,7 @@ func processBookConversion(book Book) {
 	}
 	bookText := string(contentBytes)
 
+	// Generate TTS audio from the book text using the asynchronous OpenAI API call.
 	ttsAudioPath, err := convertTextToAudio(bookText)
 	if err != nil {
 		log.Printf("Error converting text to audio for book ID %d: %v", book.ID, err)
@@ -114,6 +114,7 @@ func processBookConversion(book Book) {
 	}
 	log.Printf("TTS audio file generated at: %s for book ID %d", ttsAudioPath, book.ID)
 
+	// Update the book record.
 	book.AudioPath = ttsAudioPath
 	book.Status = "TTS completed"
 	if err := db.Save(&book).Error; err != nil {
@@ -121,10 +122,11 @@ func processBookConversion(book Book) {
 		return
 	}
 
-	// Process sound effects and merge with TTS audio.
-	processSoundEffectsAndMerge(book)
+	// Trigger sound effects merging asynchronously.
+	go processSoundEffectsAndMerge(book)
 }
 
+// updateBookStatus updates the status of a book in the database.
 func updateBookStatus(bookID uint, status string) {
 	var book Book
 	if err := db.First(&book, bookID).Error; err != nil {

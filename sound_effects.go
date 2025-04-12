@@ -37,8 +37,8 @@ func generateSoundEffect(text string) (string, error) {
 	// Prepare the JSON payload.
 	reqPayload := SoundEffectRequest{
 		Text:            text,
-		DurationSeconds: 2.0, // Example value; adjust as needed.
-		PromptInfluence: 0.3, // Example value.
+		DurationSeconds: 22.0, // Example value; adjust as needed.
+		PromptInfluence: 0.5,  // Example value.
 	}
 	reqBody, err := json.Marshal(reqPayload)
 	if err != nil {
@@ -91,13 +91,14 @@ func generateSoundEffect(text string) (string, error) {
 }
 
 // mergeAudio uses FFmpeg to overlay (mix) the TTS audio with the sound effects.
-// It first retrieves the duration of the TTS audio via ffprobe, then loops the sound
-// effects until it matches the TTS duration, and finally overlays the two audio streams,
-// encoding the output in Opus inside an Ogg container.
+// It retrieves the duration of the TTS audio via ffprobe, then loops the sound effects
+// until it matches the TTS duration. It also applies a volume reduction (to 30% of its original level)
+// on the sound effects, and overlays the two audio streams using the amix filter.
+// Finally, the merged audio is encoded using the Opus codec in an Ogg container.
 func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, error) {
 	// Get the duration of the TTS audio file using ffprobe.
-	ffprobeCmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1", ttsAudioPath)
+	ffprobeCmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",
+		"-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", ttsAudioPath)
 	ffprobeOutput, err := ffprobeCmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to get TTS duration: %w", err)
@@ -109,27 +110,28 @@ func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, erro
 	}
 	log.Printf("TTS duration: %.2f seconds", ttsDuration)
 
-	// Set the merged output file path with an .ogg extension.
+	// Define the output file path. We encode with libopus inside an Ogg container.
 	mergedAudioPath := "./audio/merged_output.ogg"
 
 	// Construct the FFmpeg filter_complex string.
-	// It loops (using -stream_loop -1) and trims the sound effects to match the TTS duration,
-	// then overlays them using amix while preserving the TTS duration.
-	filterComplex := fmt.Sprintf("[1]atrim=duration=%.2f,aloop=loop=-1:size=0[sfx];[0][sfx]amix=inputs=2:duration=first:dropout_transition=2", ttsDuration)
+	// [1] The sound effects input is trimmed to the TTS duration, looped indefinitely,
+	//     and its volume is reduced to 30% (volume=0.3).
+	// [0] The TTS audio is taken as is.
+	// The amix filter then mixes both streams, preserving the duration of the TTS audio.
+	filterComplex := fmt.Sprintf("[1]atrim=duration=%.2f,aloop=loop=-1:size=0,volume=0.3[sfx];[0][sfx]amix=inputs=2:duration=first:dropout_transition=2", ttsDuration)
 
 	// Construct the FFmpeg command arguments.
-	// - "-c:a libopus" ensures that audio is encoded with the Opus codec.
-	// - "-b:a 64k" sets the audio bitrate (adjust as needed).
 	ffmpegArgs := []string{
 		"-y",
 		"-i", ttsAudioPath,
 		"-stream_loop", "-1", "-i", soundEffectsAudioPath,
 		"-filter_complex", filterComplex,
-		"-c:a", "libopus",
-		"-b:a", "64k",
+		"-c:a", "libopus", // Use the Opus codec.
+		"-b:a", "64k", // Set a target bitrate (adjust as needed).
 		mergedAudioPath,
 	}
 
+	// Execute the FFmpeg command.
 	ffmpegCmd := exec.Command("ffmpeg", ffmpegArgs...)
 	ffmpegOutput, err := ffmpegCmd.CombinedOutput()
 	if err != nil {

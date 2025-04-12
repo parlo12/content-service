@@ -1,25 +1,35 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
+	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt"
+	"gorm.io/driver/postgres"
+	"gorm.io/gorm"
 )
 
-// Define your Book type (if not already defined in a shared package)
+// Global variables
+var db *gorm.DB
+
+// Use the JWT secret from an environment variable.
+var jwtSecretKey = []byte(getEnv("JWT_SECRET", "defaultSecrete"))
+
+// Allowed categories for validation
+var allowedCategories = []string{"Fiction", "Non-Fiction"}
+
+// Book represents the model for a book uploaded by a user.
 type Book struct {
 	ID        uint   `gorm:"primaryKey"`
 	Title     string `gorm:"not null"`
 	Author    string
 	FilePath  string // Local storage file path.
-	AudioPath string // Path/URL of the generated audio.
+	AudioPath string // Path/URL of the generated (merged) audio.
 	Status    string `gorm:"default:'pending'"`
 	Category  string `gorm:"not null;index"`
 	Genre     string `gorm:"index"`
@@ -28,198 +38,194 @@ type Book struct {
 	UpdatedAt time.Time
 }
 
-// TTSPayload represents the payload for the OpenAI TTS endpoint.
-type TTSPayload struct {
-	Input          string  `json:"input"`                     // The text to be converted to audio.
-	Model          string  `json:"model"`                     // One of: "tts-1", "tts-1-hd", or "gpt-4o-mini-tts"
-	Voice          string  `json:"voice"`                     // One of the supported voices (e.g., "alloy", "ash", etc.)
-	Instructions   string  `json:"instructions,omitempty"`    // Optional, additional voice instructions.
-	ResponseFormat string  `json:"response_format,omitempty"` // e.g., "mp3", "opus", "wav", etc.
-	Speed          float64 `json:"speed,omitempty"`           // Speed of speech (default: 1.0)
+// BookRequest defines the expected JSON structure for creating a book.
+type BookRequest struct {
+	Title    string `json:"title" binding:"required"`
+	Author   string `json:"author"`
+	Category string `json:"category" binding:"required"`
+	Genre    string `json:"genre"`
 }
 
-// openaiTTSURL is the endpoint for generating audio.
-const openaiTTSURL = "https://api.openai.com/v1/audio/speech"
+func main() {
+	// Set up the database connection and run migrations.
+	setupDatabase()
 
-// convertTextToAudio sends a POST request to OpenAI's TTS endpoint, writes the resulting
-// binary audio to a file, and returns the file path.
-func convertTextToAudio(text string) (string, error) {
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		return "", errors.New("OPENAI_API_KEY environment variable not set")
+	// Initialize Gin router.
+	router := gin.Default()
+
+	// Protected routes group.
+	authorized := router.Group("/user")
+	authorized.Use(authMiddleware())
+	{
+		authorized.POST("/books", createBookHandler)
+		authorized.GET("/books", listBooksHandler)
+		authorized.POST("/books/upload", uploadBookFileHandler)
+		authorized.GET("/books/stream/:id", streamBookAudioHandler)
 	}
 
-	payload := TTSPayload{
-		Input:          text,
-		Model:          "gpt-4o-mini-tts", // Choose "tts-1", "tts-1-hd" or "gpt-4o-mini-tts" as needed.
-		Voice:          "alloy",           // Choose one of the supported voices.
-		ResponseFormat: "mp3",             // For efficient file size, use mp3.
-		Speed:          1.0,
-		// Instructions: "Speak in a clear and engaging tone.", // Optional.
+	// Use PORT env var if set; default to 8083.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8083"
 	}
+	log.Printf("Content service listening on port %s", port)
+	router.Run(":" + port)
+}
 
-	reqBody, err := json.Marshal(payload)
+// setupDatabase connects to PostgreSQL and auto migrates the Book model.
+func setupDatabase() {
+	dbHost := getEnv("DB_HOST", "")
+	dbUser := getEnv("DB_USER", "")
+	dbPassword := getEnv("DB_PASSWORD", "")
+	dbName := getEnv("DB_NAME", "")
+	dbPort := getEnv("DB_PORT", "")
+	dsn := "host=" + dbHost +
+		" user=" + dbUser +
+		" password=" + dbPassword +
+		" dbname=" + dbName +
+		" port=" + dbPort +
+		" sslmode=disable TimeZone=UTC"
+
+	var err error
+	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
-		return "", fmt.Errorf("failed to marshal TTS payload: %w", err)
+		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", openaiTTSURL, bytes.NewReader(reqBody))
-	if err != nil {
-		return "", fmt.Errorf("failed to create TTS request: %w", err)
+	if err := db.AutoMigrate(&Book{}); err != nil {
+		log.Fatalf("AutoMigrate failed: %v", err)
 	}
-
-	req.Header.Add("Authorization", "Bearer "+apiKey)
-	req.Header.Add("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("TTS API request error: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("TTS API returned status %d: %s", resp.StatusCode, string(bodyBytes))
-	}
-
-	audioData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("failed to read TTS audio response: %w", err)
-	}
-
-	// Ensure the audio directory exists.
-	if err := os.MkdirAll("./audio", 0755); err != nil {
-		return "", fmt.Errorf("failed to create audio directory: %w", err)
-	}
-
-	// Create a unique filename.
-	filename := fmt.Sprintf("audio_%d.mp3", time.Now().Unix())
-	audioPath := "./audio/" + filename
-
-	if err := os.WriteFile(audioPath, audioData, 0644); err != nil {
-		return "", fmt.Errorf("failed to write audio file: %w", err)
-	}
-
-	return audioPath, nil
+	log.Println("Database connected and migrated successfully")
 }
 
-// mergeAudio uses FFmpeg via a system call (or other means) to mix the two audio files
-// so that the sound effects match the duration of the TTS audio.
-// This example uses a simplified approach: it calls FFmpeg to concat the TTS audio and sound effects.
-// (For proper mixing, you might need more advanced FFmpeg filtergraphs.)
-func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, error) {
-	mergedAudioPath := "./audio/merged_output.mp3"
-
-	// Example FFmpeg command (this is a basic concat, adjust according to your audio mixing needs):
-	// Here we assume the TTS audio and sound effects are to be mixed (overlayed) so that the sound effects do not shorten the TTS.
-	// For overlaying audio (mixing), the following FFmpeg command is an example:
-	// ffmpeg -i tts.mp3 -i effects.mp3 -filter_complex "amix=inputs=2:duration=first:dropout_transition=3" output.mp3
-	cmd := fmt.Sprintf("ffmpeg -y -i %s -i %s -filter_complex \"amix=inputs=2:duration=first:dropout_transition=3\" %s",
-		ttsAudioPath, soundEffectsAudioPath, mergedAudioPath)
-
-	// Execute the command.
-	output, err := executeFFmpegCommand(cmd)
-	if err != nil {
-		return "", fmt.Errorf("failed to merge audio: %w. FFmpeg output: %s", err, output)
+func createBookHandler(c *gin.Context) {
+	var req BookRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("Error in book request binding: %v", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid book data", "details": err.Error()})
+		return
 	}
 
-	log.Printf("Merging TTS audio '%s' with sound effects '%s' into '%s'", ttsAudioPath, soundEffectsAudioPath, mergedAudioPath)
-	return mergedAudioPath, nil
+	if !isValidCategory(req.Category) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid category", "allowed_categories": allowedCategories})
+		return
+	}
+
+	claims, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication claims missing"})
+		return
+	}
+	userClaims, ok := claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid token claims"})
+		return
+	}
+	userIDFloat, ok := userClaims["user_id"].(float64)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in token"})
+		return
+	}
+	userID := uint(userIDFloat)
+
+	book := Book{
+		Title:    req.Title,
+		Author:   req.Author,
+		Category: req.Category,
+		Genre:    req.Genre,
+		Status:   "pending",
+		UserID:   userID,
+	}
+	if err := db.Create(&book).Error; err != nil {
+		log.Printf("Error creating book record: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save book", "details": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Book saved", "book": book})
 }
 
-// executeFFmpegCommand executes an FFmpeg command and returns its output (if any).
-func executeFFmpegCommand(command string) (string, error) {
-	// You can use os/exec to execute the command.
-	// For example:
-	//    cmd := exec.Command("sh", "-c", command)
-	//    output, err := cmd.CombinedOutput()
-	// Make sure FFmpeg is installed in your container.
-	// Here is a quick implementation:
-	cmd := exec.Command("sh", "-c", command)
-	output, err := cmd.CombinedOutput()
-	return string(output), err
+func listBooksHandler(c *gin.Context) {
+	claims, exists := c.Get("claims")
+	if !exists {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Authentication claims missing"})
+		return
+	}
+	userClaims, ok := claims.(jwt.MapClaims)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid token claims"})
+		return
+	}
+	userIDFloat, ok := userClaims["user_id"].(float64)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "User ID not found in token"})
+		return
+	}
+	userID := uint(userIDFloat)
+
+	category := c.Query("category")
+	genre := c.Query("genre")
+
+	var books []Book
+	query := db.Where("user_id = ?", userID)
+	if category != "" {
+		query = query.Where("category = ?", category)
+	}
+	if genre != "" {
+		query = query.Where("genre = ?", genre)
+	}
+	if err := query.Find(&books).Error; err != nil {
+		log.Printf("Error retrieving books for user %d: %v", userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch books", "details": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"books": books})
 }
 
-// execCommand is a helper that executes a command and returns its combined output.
-func execCommand(name string, arg ...string) (string, error) {
-	// Import the os/exec package at the top of your file.
-	// (If not already imported, add: "os/exec")
-	cmd := exec.Command(name, arg...)
-	output, err := cmd.CombinedOutput()
-	return string(output), err
+func isValidCategory(category string) bool {
+	for _, allowed := range allowedCategories {
+		if strings.EqualFold(category, allowed) {
+			return true
+		}
+	}
+	return false
 }
 
-// processBookConversionAsync processes a book asynchronously. It reads the book's text,
-// calls the TTS conversion, updates the record, and optionally merges sound effects.
-// This function runs in a separate goroutine.
-func processBookConversionAsync(book Book) {
-	go func(b Book) {
-		// Step 1: Read the text from the book file.
-		contentBytes, err := os.ReadFile(b.FilePath)
+func authMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		tokenString, err := extractToken(c.GetHeader("Authorization"))
 		if err != nil {
-			log.Printf("Error reading file for book ID %d: %v", b.ID, err)
-			updateBookStatus(b.ID, "failed")
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
 			return
 		}
-		bookText := string(contentBytes)
-
-		// Step 2: Convert text to TTS audio.
-		ttsAudioPath, err := convertTextToAudio(bookText)
-		if err != nil {
-			log.Printf("Error converting text to audio for book ID %d: %v", b.ID, err)
-			updateBookStatus(b.ID, "failed")
+		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, errors.New("unexpected signing method")
+			}
+			return jwtSecretKey, nil
+		})
+		if err != nil || !token.Valid {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 			return
 		}
-		log.Printf("TTS audio file generated at: %s for book ID %d", ttsAudioPath, b.ID)
-		b.AudioPath = ttsAudioPath
-		b.Status = "TTS completed"
-		if err := db.Save(&b).Error; err != nil {
-			log.Printf("Error updating book record for book ID %d: %v", b.ID, err)
-			return
-		}
-
-		// Step 3: (Optional) Generate sound effects and merge with TTS.
-		// First, generate an overall sound prompt.
-		overallPrompt, err := generateOverallSoundPrompt(b.FilePath)
-		if err != nil {
-			log.Printf("Error generating overall sound prompt for book ID %d: %v", b.ID, err)
-			updateBookStatus(b.ID, "failed")
-			return
-		}
-		log.Printf("Generated overall sound prompt for book ID %d: %s", b.ID, overallPrompt)
-
-		// Generate sound effects using the overall prompt.
-		soundEffectsFilePath, err := generateSoundEffect(overallPrompt)
-		if err != nil {
-			log.Printf("Error generating sound effects for book ID %d: %v", b.ID, err)
-			updateBookStatus(b.ID, "failed")
-			return
-		}
-		log.Printf("Sound effects file generated for book ID %d: %s", b.ID, soundEffectsFilePath)
-
-		// Merge the TTS audio with the sound effects.
-		mergedAudioPath, err := mergeAudio(b.AudioPath, soundEffectsFilePath)
-		if err != nil {
-			log.Printf("Error merging audio for book ID %d: %v", b.ID, err)
-			updateBookStatus(b.ID, "failed")
-			return
-		}
-
-		// Update the Book record with the merged audio path.
-		b.AudioPath = mergedAudioPath
-		if err := db.Save(&b).Error; err != nil {
-			log.Printf("Error updating book record after merging audio for book ID %d: %v", b.ID, err)
-		} else {
-			log.Printf("Merged audio generated and saved for Book ID %d", b.ID)
-		}
-	}(book)
+		c.Set("claims", token.Claims)
+		c.Next()
+	}
 }
 
-// (You’ll need to define generateOverallSoundPrompt somewhere in your project.)
-// For demonstration, here’s a stub that simulates generating a prompt based on the book text.
-func generateOverallSoundPrompt(filePath string) (string, error) {
-	// In practice, you might call ChatGPT (or similar) asynchronously to generate a detailed prompt.
-	// Here, we simply return a static prompt.
-	return "Dramatic echoing footsteps with a distant eerie wind", nil
+func extractToken(authHeader string) (string, error) {
+	if authHeader == "" {
+		return "", errors.New("Authorization header missing")
+	}
+	parts := strings.Split(authHeader, " ")
+	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+		return "", errors.New("Authorization header format must be Bearer {token}")
+	}
+	return parts[1], nil
+}
+
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
 }
