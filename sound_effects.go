@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,24 +24,23 @@ const elevenLabsSoundEffectsURL = "https://api.elevenlabs.io/v1/sound-generation
 // SoundEffectRequest represents the JSON payload for the sound effects endpoint.
 type SoundEffectRequest struct {
 	Text            string  `json:"text"`                       // Required: The prompt text for the sound effect.
-	DurationSeconds float64 `json:"duration_seconds,omitempty"` // Optional: Duration (e.g., 2.0 seconds).
-	PromptInfluence float64 `json:"prompt_influence,omitempty"` // Optional: Value between 0 and 1; defaults to 0.3.
+	DurationSeconds float64 `json:"duration_seconds,omitempty"` // Optional: Duration (e.g., 22 seconds per segment).
+	PromptInfluence float64 `json:"prompt_influence,omitempty"` // Optional: Value between 0 and 1.
 }
 
 // generateSoundEffect calls ElevenLabs' sound effects endpoint using the provided text.
-// Instead of returning a string, this function writes the binary MP3 response to a file
-// and returns the file path.
+// It writes the binary MP3 response to a file and returns the file path.
 func generateSoundEffect(text string) (string, error) {
 	apiKey := os.Getenv("XI_API_KEY")
 	if apiKey == "" {
 		return "", errors.New("XI_API_KEY environment variable not set")
 	}
 
-	// Prepare the JSON payload.
+	// Prepare the JSON payload with a fixed 22-second duration for each segment.
 	reqPayload := SoundEffectRequest{
 		Text:            text,
-		DurationSeconds: 22.0, // Example value; adjust as needed.
-		PromptInfluence: 0.5,  // Example value.
+		DurationSeconds: 22.0,
+		PromptInfluence: 0.5,
 	}
 	reqBody, err := json.Marshal(reqPayload)
 	if err != nil {
@@ -53,7 +55,7 @@ func generateSoundEffect(text string) (string, error) {
 	req.Header.Add("xi-api-key", apiKey)
 	req.Header.Add("Content-Type", "application/json")
 
-	// Set up an HTTP client with a timeout.
+	// Use an HTTP client with a timeout.
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -61,7 +63,6 @@ func generateSoundEffect(text string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	// Check that the request succeeded.
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("sound effects API returned status %d: %s", resp.StatusCode, string(bodyBytes))
@@ -78,8 +79,8 @@ func generateSoundEffect(text string) (string, error) {
 		return "", fmt.Errorf("failed to create audio directory: %w", err)
 	}
 
-	// Generate a unique filename for the sound effect.
-	filename := fmt.Sprintf("sound_effect_%d.mp3", time.Now().Unix())
+	// Generate a unique filename for this segment.
+	filename := fmt.Sprintf("sound_effect_%d.mp3", time.Now().UnixNano())
 	filePath := "./audio/" + filename
 
 	// Write the binary data to the file.
@@ -90,61 +91,120 @@ func generateSoundEffect(text string) (string, error) {
 	return filePath, nil
 }
 
+// generateMultipleSoundEffects calculates how many 22-second segments are needed to cover the TTS duration,
+// then generates them asynchronously and returns a slice of file paths.
+func generateMultipleSoundEffects(prompt string, ttsDuration float64, segmentDuration float64) ([]string, error) {
+	segmentsNeeded := int(math.Ceil(ttsDuration / segmentDuration))
+	log.Printf("Generating %d sound effect segments to cover %.2f seconds (each %.2f seconds long)", segmentsNeeded, ttsDuration, segmentDuration)
+
+	segmentFiles := make([]string, segmentsNeeded)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	errChan := make(chan error, segmentsNeeded)
+
+	for i := 0; i < segmentsNeeded; i++ {
+		wg.Add(1)
+		go func(segmentIndex int) {
+			defer wg.Done()
+			// You could modify the prompt per segment if desired.
+			segmentPrompt := prompt
+			filePath, err := generateSoundEffect(segmentPrompt)
+			if err != nil {
+				errChan <- err
+				return
+			}
+			mu.Lock()
+			segmentFiles[segmentIndex] = filePath
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	close(errChan)
+	if len(errChan) > 0 {
+		return nil, <-errChan
+	}
+	return segmentFiles, nil
+}
+
+// mergeMultipleSoundEffects uses FFmpeg's concat demuxer to merge multiple sound effect segments into one file.
+func mergeMultipleSoundEffects(segmentFiles []string) (string, error) {
+	// Ensure the audio directory exists.
+	if err := os.MkdirAll("./audio", 0755); err != nil {
+		return "", fmt.Errorf("failed to create audio directory: %w", err)
+	}
+
+	// Write the file list in the ./audio directory using only the base names.
+	fileListPath := "./audio/segment_list.txt"
+	var fileListContent strings.Builder
+	for _, file := range segmentFiles {
+		baseName := filepath.Base(file)
+		fileListContent.WriteString(fmt.Sprintf("file '%s'\n", baseName))
+	}
+	if err := os.WriteFile(fileListPath, []byte(fileListContent.String()), 0644); err != nil {
+		return "", fmt.Errorf("failed to write file list: %w", err)
+	}
+
+	// Define the merged output file name relative to the "./audio" directory.
+	mergedFileRelative := "merged_sound_effects.mp3"
+	mergedFilePath := "./audio/" + mergedFileRelative
+
+	// Construct FFmpeg arguments.
+	ffmpegArgs := []string{
+		"-y",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", "segment_list.txt",
+		"-c", "copy",
+		mergedFileRelative,
+	}
+
+	// Set working directory to the audio folder.
+	cmd := exec.Command("ffmpeg", ffmpegArgs...)
+	cmd.Dir = "./audio"
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ffmpeg concat command failed: %v, output: %s", err, string(output))
+	}
+	return mergedFilePath, nil
+}
+
 // mergeAudio uses FFmpeg to overlay (mix) the TTS audio with the sound effects.
-// It retrieves the duration of the TTS audio via ffprobe, then loops the sound effects
-// until it matches the TTS duration. It also applies a volume reduction (to 30% of its original level)
-// on the sound effects, and overlays the two audio streams using the amix filter.
-// Finally, the merged audio is encoded using the Opus codec in an Ogg container.
-func mergeAudio(ttsAudioPath string, soundEffectsAudioPath string) (string, error) {
-	// Get the duration of the TTS audio file using ffprobe.
-	ffprobeCmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",
-		"-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", ttsAudioPath)
-	ffprobeOutput, err := ffprobeCmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to get TTS duration: %w", err)
-	}
-	durationStr := strings.TrimSpace(string(ffprobeOutput))
-	ttsDuration, err := strconv.ParseFloat(durationStr, 64)
-	if err != nil {
-		return "", fmt.Errorf("failed to parse TTS duration: %w", err)
-	}
-	log.Printf("TTS duration: %.2f seconds", ttsDuration)
+// It retrieves the duration of the TTS audio via ffprobe, then constructs a filter_complex string that:
+//   - [1]: Trims and loops the sound effects to match the TTS duration and scales its volume by volumeScale.
+//   - [0]: Uses the TTS audio as is.
+//
+// Then it mixes them using amix (keeping the TTS duration), and encodes the final output using libopus in an Ogg container.
+func mergeAudio(ttsAudioPath string, mergedSfxPath string, ttsDuration float64, volumeScale float64) (string, error) {
+	finalOutputPath := "./audio/final_merged_output.ogg"
 
-	// Define the output file path. We encode with libopus inside an Ogg container.
-	mergedAudioPath := "./audio/merged_output.ogg"
+	// Construct FFmpeg filter_complex string.
+	// Note: We do NOT want any literal '%' characters in the dropout_transition value.
+	filterComplex := fmt.Sprintf("[1]atrim=duration=%.2f,volume=%.2f[sfx];[0][sfx]amix=inputs=2:duration=first:dropout_transition=2", ttsDuration, volumeScale)
 
-	// Construct the FFmpeg filter_complex string.
-	// [1] The sound effects input is trimmed to the TTS duration, looped indefinitely,
-	//     and its volume is reduced to 30% (volume=0.3).
-	// [0] The TTS audio is taken as is.
-	// The amix filter then mixes both streams, preserving the duration of the TTS audio.
-	filterComplex := fmt.Sprintf("[1]atrim=duration=%.2f,aloop=loop=-1:size=0,volume=0.3[sfx];[0][sfx]amix=inputs=2:duration=first:dropout_transition=2", ttsDuration)
-
-	// Construct the FFmpeg command arguments.
 	ffmpegArgs := []string{
 		"-y",
 		"-i", ttsAudioPath,
-		"-stream_loop", "-1", "-i", soundEffectsAudioPath,
+		"-i", mergedSfxPath,
 		"-filter_complex", filterComplex,
 		"-c:a", "libopus", // Use the Opus codec.
-		"-b:a", "64k", // Set a target bitrate (adjust as needed).
-		mergedAudioPath,
+		"-b:a", "64k", // Target bitrate (adjust as needed).
+		finalOutputPath,
 	}
 
-	// Execute the FFmpeg command.
-	ffmpegCmd := exec.Command("ffmpeg", ffmpegArgs...)
-	ffmpegOutput, err := ffmpegCmd.CombinedOutput()
+	cmd := exec.Command("ffmpeg", ffmpegArgs...)
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("ffmpeg command failed: %v, output: %s", err, string(ffmpegOutput))
+		return "", fmt.Errorf("ffmpeg merge command failed: %v, output: %s", err, string(output))
 	}
 
-	log.Printf("Merging TTS audio '%s' with sound effects '%s' into '%s'", ttsAudioPath, soundEffectsAudioPath, mergedAudioPath)
-	return mergedAudioPath, nil
+	log.Printf("Merging TTS audio '%s' with background music '%s' into '%s'", ttsAudioPath, mergedSfxPath, finalOutputPath)
+	return finalOutputPath, nil
 }
 
-// processSoundEffectsAndMerge generates sound effects based on an overall prompt (generated from book text)
-// and then merges these effects with the TTS audio for the given book.
-// Note: The functions generateOverallSoundPrompt and updateBookStatus are assumed to be defined elsewhere.
+// processSoundEffectsAndMerge orchestrates the generation and merging of background sound effects with TTS narration.
+// It generates an overall background prompt from the book's text, calculates the TTS duration,
+// dynamically generates the required number of sound effect segments, merges them into one track, and
+// overlays that track (at a reduced volume) with the TTS narration.
 func processSoundEffectsAndMerge(book Book) {
 	// Generate an overall sound prompt from the book's text.
 	overallPrompt, err := generateOverallSoundPrompt(book.FilePath)
@@ -155,28 +215,58 @@ func processSoundEffectsAndMerge(book Book) {
 	}
 	log.Printf("Generated overall sound prompt for book ID %d: %s", book.ID, overallPrompt)
 
-	// Generate sound effects using the overall prompt.
-	soundEffectsFilePath, err := generateSoundEffect(overallPrompt)
+	// Get TTS duration using ffprobe.
+	ffprobeCmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0",
+		"-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", book.AudioPath)
+	ffprobeOutput, err := ffprobeCmd.Output()
 	if err != nil {
-		log.Printf("Error generating sound effects for book ID %d: %v", book.ID, err)
+		log.Printf("Error getting TTS duration: %v", err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
-	log.Printf("Sound effects file generated for book ID %d: %s", book.ID, soundEffectsFilePath)
-
-	// Merge the TTS audio and the generated sound effects.
-	mergedAudioPath, err := mergeAudio(book.AudioPath, soundEffectsFilePath)
+	durationStr := strings.TrimSpace(string(ffprobeOutput))
+	ttsDuration, err := strconv.ParseFloat(durationStr, 64)
 	if err != nil {
-		log.Printf("Error merging audio for book ID %d: %v", book.ID, err)
+		log.Printf("Error parsing TTS duration: %v", err)
+		updateBookStatus(book.ID, "failed")
+		return
+	}
+	log.Printf("TTS duration: %.2f seconds", ttsDuration)
+
+	// Define segment duration (22 seconds per segment).
+	segmentDuration := 22.0
+
+	// Dynamically calculate how many segments are needed.
+	segmentFiles, err := generateMultipleSoundEffects(overallPrompt, ttsDuration, segmentDuration)
+	if err != nil {
+		log.Printf("Error generating sound effect segments for book ID %d: %v", book.ID, err)
+		updateBookStatus(book.ID, "failed")
+		return
+	}
+
+	// Merge the individual segments into one background music track.
+	mergedSfxPath, err := mergeMultipleSoundEffects(segmentFiles)
+	if err != nil {
+		log.Printf("Error merging sound effect segments for book ID %d: %v", book.ID, err)
+		updateBookStatus(book.ID, "failed")
+		return
+	}
+	log.Printf("Merged sound effects track for book ID %d: %s", book.ID, mergedSfxPath)
+
+	// Merge the TTS audio with the merged background track.
+	// Set volumeScale to 0.10 (10%) for the background music relative to the narration.
+	finalMergedPath, err := mergeAudio(book.AudioPath, mergedSfxPath, ttsDuration, 0.10)
+	if err != nil {
+		log.Printf("Error merging final audio for book ID %d: %v", book.ID, err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
 
 	// Update the Book record with the new merged audio file path.
-	book.AudioPath = mergedAudioPath
+	book.AudioPath = finalMergedPath
 	if err := db.Save(&book).Error; err != nil {
 		log.Printf("Error updating book record after merging audio for book ID %d: %v", book.ID, err)
 	} else {
-		log.Printf("Merged audio generated and saved for Book ID %d", book.ID)
+		log.Printf("Final merged audio generated and saved for Book ID %d", book.ID)
 	}
 }
