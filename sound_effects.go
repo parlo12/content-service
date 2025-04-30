@@ -189,8 +189,8 @@ Output ONLY a JSON array of %d segments with keys "start", "end", and "mood" (on
 	// ----------------------------
 
 	var segs []Segment
-	if err := json.Unmarshal([]byte(c), &segs); err != nil {
-		log.Printf("invalid segmentation JSON: %v\nraw: %s\nfalling back", err, c)
+	if err := json.Unmarshal([]byte(trimmed), &segs); err != nil {
+		log.Printf("invalid segmentation JSON: %v\nraw: %s\nfalling back", err, trimmed)
 		return fallbackSegments(ttsDur), nil
 	}
 	return segs, nil
