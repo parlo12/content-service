@@ -14,12 +14,22 @@ import (
 	"time"
 )
 
+// wrapSSML ensures we always send a single <speak>…</speak> block
+func wrapSSML(text string) string {
+	t := strings.TrimSpace(text)
+	if strings.HasPrefix(t, "<speak") {
+		return t
+	}
+	return "<speak>\n" + t + "\n</speak>"
+}
+
 // openaiTTSEndpoint is the endpoint for generating audio from text using OpenAI's TTS.
 const openaiTTSEndpoint = "https://api.openai.com/v1/audio/speech"
 
 // TTSPayload represents the JSON payload for the OpenAI TTS endpoint.
 type TTSPayload struct {
 	Input          string  `json:"input"`                     // SSML input
+	InputFormat    string  `json:"input_format,omitempty"`    // "ssml or text"
 	Model          string  `json:"model"`                     // e.g. "gpt-4o-mini-tts"
 	Voice          string  `json:"voice"`                     // e.g. "alloy"
 	Instructions   string  `json:"instructions,omitempty"`    // must mention SSML
@@ -31,12 +41,12 @@ type TTSPayload struct {
 // It asks GPT to produce a single <speak>…</speak> block.
 func generateSSML(rawText string) (string, error) {
 	systemContent := `You are an expressive audiobook narrator.
-Convert this into SSML:
-- Use <break time="500ms"/> at natural pauses
-- Wrap key phrases in <emphasis>
-- Use <prosody rate="80%">…</prosody> for sad passages
-- Use <prosody rate="110%">…</prosody> for action passages
-Output only the SSML wrapped in one <speak>…</speak> block.`
+					Convert this into SSML:
+					- Use <break time="500ms"/> at natural pauses
+					- Wrap key phrases in <emphasis>
+					- Use <prosody rate="80%">…</prosody> for sad passages
+					- Use <prosody rate="110%">…</prosody> for action passages
+					Output only the SSML wrapped in one <speak>…</speak> block.`
 
 	reqBody := ChatRequest{
 		Model: "gpt-4o",
@@ -78,10 +88,24 @@ Output only the SSML wrapped in one <speak>…</speak> block.`
 		return "", errors.New("no SSML choices returned")
 	}
 
-	ssml := strings.TrimSpace(chatResp.Choices[0].Message.Content)
-	if !strings.HasPrefix(ssml, "<speak") {
-		ssml = "<speak>" + ssml + "</speak>"
-	}
+	// ssml := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	// if !strings.HasPrefix(ssml, "<speak") {
+	// 	ssml = "<speak>" + ssml + "</speak>"
+	// }
+	// return ssml, nil
+
+	// clean out any markdown fences that GPT might wrap it in
+	raw := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	raw = strings.ReplaceAll(raw, "```", "")
+	raw = strings.ReplaceAll(raw, "```ssml", "")
+	raw = strings.ReplaceAll(raw, "```xml", "")
+	raw = strings.TrimPrefix(raw, "```xml")
+	raw = strings.ReplaceAll(raw, "```xml ssml", "")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	// ensure a single <speak>…</speak> block
+	ssml := wrapSSML(raw)
+	log.Printf("SSML: %s", ssml)
 	return ssml, nil
 }
 
@@ -91,6 +115,9 @@ func convertTextToAudio(text string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("SSML generation failed: %w", err)
 	}
+	// ensure all breaks/emphasis/etc. are inside a single <speak>…</speak> block
+	ssml = wrapSSML(ssml)
+	log.Printf("SSML: %s", ssml)
 
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
@@ -101,7 +128,7 @@ func convertTextToAudio(text string) (string, error) {
 		Input:          ssml,
 		Model:          "gpt-4o-mini-tts",
 		Voice:          "alloy",
-		Instructions:   "Interpret the input as SSML.",
+		Instructions:   "Interpret the input as SSML: apply breaks, prosody and emphasis tags but do not speak them.",
 		ResponseFormat: "mp3",
 		Speed:          1.0,
 	}
@@ -113,8 +140,8 @@ func convertTextToAudio(text string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 60 * time.Second}
+	// increase timeout to 120 seconds for longer books
+	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("TTS API request error: %w", err)

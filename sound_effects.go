@@ -212,7 +212,7 @@ func generateDynamicBackgroundWithSegments(ttsDur float64, bgPath string, segs [
 		cmd := exec.Command("ffmpeg", "-y",
 			"-stream_loop", "-1", "-i", bgPath,
 			"-t", fmt.Sprintf("%.2f", total),
-			"-af", fmt.Sprintf("adelay=%s,volume=0.20", delayStr),
+			"-af", fmt.Sprintf("adelay=%s,volume=0.30", delayStr),
 			out,
 		)
 		if o, err := cmd.CombinedOutput(); err != nil {
@@ -272,7 +272,7 @@ func mergeAudio(ttsPath, bgPath, bookPath string) (string, error) {
 
 	// **TURN DOWN MUSIC BEFORE MIXING**
 	outFile := "./merged_output.ogg"
-	filterComplex := "[1]volume=0.20[bg];[0][bg]amix=inputs=2:duration=first:dropout_transition=2"
+	filterComplex := "[1]volume=0.30[bg];[0][bg]amix=inputs=2:duration=first:dropout_transition=2"
 	cmd := exec.Command("ffmpeg", "-y",
 		"-i", ttsPath, "-i", dynBg,
 		"-filter_complex", filterComplex,
@@ -411,7 +411,7 @@ func overlaySoundEvents(baseMix string, events EventMap) (string, error) {
 			outLbl := fmt.Sprintf("[e%d_%d]", inputIdx, j)
 			// *** FIX: delay + lower SFX to 20% so TTS stays clear
 			filters = append(filters,
-				fmt.Sprintf("%sadelay=%d|%d,volume=0.15%s", inLbl, d, d, outLbl),
+				fmt.Sprintf("%sadelay=%d|%d,volume=0.45%s", inLbl, d, d, outLbl),
 			)
 			labels = append(labels, outLbl)
 		}
