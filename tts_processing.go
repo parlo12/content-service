@@ -231,6 +231,8 @@ func processBookConversion(book Book) {
 	go processSoundEffectsAndMerge(book)
 }
 
+// adding this comment to check if my deployment works
+
 // updateBookStatus updates the status of a book in the database.
 func updateBookStatus(bookID uint, status string) {
 	var book Book
