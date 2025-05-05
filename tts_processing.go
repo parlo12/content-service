@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 // wrapSSML ensures we always send a single <speak>…</speak> block
@@ -173,15 +175,43 @@ func convertTextToAudio(text string) (string, error) {
 
 // processBookConversion reads the book, TTS-converts it and kicks off sound-effects.
 func processBookConversion(book Book) {
+	// 0) if another user already processed the same title+author, just reuse that audio:
+	var dup Book
+	err := db.
+		Where("title = ? AND author = ? AND audio_path IS NOT NULL AND audio_path <> ''",
+			book.Title, book.Author).
+		First(&dup).Error
+	if err == nil {
+		log.Printf("Reusing existing audio for '%s' by %s → %s", book.Title, book.Author, dup.AudioPath)
+		book.AudioPath = dup.AudioPath
+		book.Status = "TTS reused"
+		if err := db.Save(&book).Error; err != nil {
+			log.Printf("Error saving reused audio for book ID %d: %v", book.ID, err)
+		}
+		return
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		// some other DB error
+		log.Printf("Error checking for existing audio: %v", err)
+	}
+
+	// 1) Check file exists...
+	if _, err := os.Stat(book.FilePath); os.IsNotExist(err) {
+		log.Printf("File does not exist for book ID %d: %s", book.ID, book.FilePath)
+		updateBookStatus(book.ID, "failed")
+		return
+	}
+
+	// 2) Read the file content
 	contentBytes, err := os.ReadFile(book.FilePath)
 	if err != nil {
 		log.Printf("Error reading file for book ID %d: %v", book.ID, err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
-	bookText := string(contentBytes)
 
-	ttsPath, err := convertTextToAudio(bookText)
+	// 3) Generate TTS
+	ttsPath, err := convertTextToAudio(string(contentBytes))
 	if err != nil {
 		log.Printf("Error converting text to audio for book ID %d: %v", book.ID, err)
 		updateBookStatus(book.ID, "failed")
@@ -189,6 +219,7 @@ func processBookConversion(book Book) {
 	}
 	log.Printf("TTS audio file generated at: %s for book ID %d", ttsPath, book.ID)
 
+	// 4) Save and mark complete
 	book.AudioPath = ttsPath
 	book.Status = "TTS completed"
 	if err := db.Save(&book).Error; err != nil {
@@ -196,6 +227,7 @@ func processBookConversion(book Book) {
 		return
 	}
 
+	// 5) Kick off SFX merge
 	go processSoundEffectsAndMerge(book)
 }
 
