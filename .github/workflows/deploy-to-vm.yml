@@ -1,6 +1,5 @@
 name: 🚀 Deploy Content-Service
 
-# fire on every push to main, and also allow manual “Run workflow” from the UI
 on:
   push:
     branches: [ main ]
@@ -8,31 +7,22 @@ on:
 
 jobs:
   deploy:
-    name: Deploy Content-Service
     runs-on: ubuntu-latest
-
     steps:
-      # this step actually SSH’s into your VM and runs your script
       - name: SSH & Deploy
         uses: appleboy/ssh-action@master
         with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key:      ${{ secrets.VM_SSH_KEY }}   # your private key
-          port:     ${{ secrets.VM_SSH_PORT }}
+          host:      ${{ secrets.VM_HOST }}
+          username:  ${{ secrets.VM_USER }}
+          key:       ${{ secrets.VM_SSH_KEY }}
+          port:      ${{ secrets.VM_SSH_PORT }}
           script: |
             set -e
-            cd /home/opc/streaming-app # use absolute path instead of 
+            cd /home/opc/streaming-app/content-service     # <— point inside your Git repo
             git fetch origin main
             git reset --hard origin/main
 
             docker compose down
-
-            # rebuild only the content‐service
             docker compose build content-service
-
-            # bring it back up
             docker compose up -d content-service
-            
-            # (optional) clean up old images
             docker image prune -f
