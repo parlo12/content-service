@@ -22,7 +22,7 @@ jobs:
           port:     ${{ secrets.VM_SSH_PORT }}
           script: |
             set -e
-            cd ~/streaming-app
+            cd /home/opc/streaming-app # use absolute path instead of 
             git fetch origin main
             git reset --hard origin/main
 
@@ -33,6 +33,6 @@ jobs:
 
             # bring it back up
             docker compose up -d content-service
-
+            
             # (optional) clean up old images
             docker image prune -f
