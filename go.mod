@@ -5,8 +5,11 @@ go 1.24.2
 require (
 	github.com/gin-gonic/gin v1.10.0
 	github.com/golang-jwt/jwt v3.2.2+incompatible
+	github.com/kapmahc/epub v0.1.1
 	gorm.io/driver/postgres v1.5.11
 	gorm.io/gorm v1.25.12
+	rsc.io/pdf v0.1.1
+
 )
 
 require (
@@ -42,7 +45,7 @@ require (
 	golang.org/x/net v0.25.0 // indirect
 	golang.org/x/sync v0.1.0 // indirect
 	golang.org/x/sys v0.26.0 // indirect
-	golang.org/x/text v0.15.0 // indirect
+	golang.org/x/text v0.15.0
 	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

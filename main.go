@@ -46,9 +46,34 @@ type BookRequest struct {
 	Genre    string `json:"genre"`
 }
 
+// Chunk represents the model for chunks or segments of boook
+type BookChunk struct {
+	ID        uint   `gorm:"primaryKey"`
+	BookID    uint   `gorm:"index"`
+	Index     int    // Index of the chunk in the book
+	Content   string `gorm:"type:text"` // Text content of the chunk
+	AudioPath string `gorm:"not null"`
+	TTSStatus string // values: "pending", "processing", "completed", "failed"
+	StartTime int64  // Start time in seconds
+	EndTime   int64  // End time in seconds
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+type TTSQueueJob struct {
+	ID        uint   `gorm:"primaryKey"`
+	BookID    uint   `gorm:"index"`
+	ChunkIDs  string // Comma-separated chunk ID list
+	Status    string `gorm:"default:'queued'"` // queued, processing, complete, failed
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	UserID    uint `gorm:"index"`
+}
+
 func main() {
 	// Set up the database connection and run migrations.
 	setupDatabase()
+	startTTSWorker()
 
 	// Initialize Gin router.
 	router := gin.Default()
@@ -61,6 +86,16 @@ func main() {
 		authorized.GET("/books", listBooksHandler)
 		authorized.POST("/books/upload", uploadBookFileHandler)
 		authorized.GET("/books/stream/:id", streamBookAudioHandler)
+		authorized.POST("/chunks/tts", ProcessChunksTTSHandler)
+		authorized.GET("/chunks/tts/merged-audio/:book_id", streamMergedChunkAudioHandler)
+		authorized.GET("/books/:book_id/chunks/:start/:end/audio", streamChunkGroupAudioHandler)
+		//authorized.GET("/chunks/status", checkChunkQueueStatusHandler)
+
+		// processing old chunks
+		authorized.GET("/books/:book_id/chunks/processed", listProcessedChunkGroupsHandler)
+		// stream audio by chunk IDs
+		authorized.POST("/chunks/audio-by-id", streamAudioByChunkIDsHandler)
+
 	}
 
 	// Use PORT env var if set; default to 8083.
@@ -92,7 +127,7 @@ func setupDatabase() {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
 
-	if err := db.AutoMigrate(&Book{}); err != nil {
+	if err := db.AutoMigrate(&Book{}, &BookChunk{}, &ProcessedChunkGroup{}, &TTSQueueJob{}); err != nil {
 		log.Fatalf("AutoMigrate failed: %v", err)
 	}
 	log.Println("Database connected and migrated successfully")
@@ -214,11 +249,11 @@ func authMiddleware() gin.HandlerFunc {
 
 func extractToken(authHeader string) (string, error) {
 	if authHeader == "" {
-		return "", errors.New("Authorization header missing")
+		return "", errors.New("authorization header missing")
 	}
 	parts := strings.Split(authHeader, " ")
 	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return "", errors.New("Authorization header format must be Bearer {token}")
+		return "", errors.New("authorization header format must be Bearer {token}")
 	}
 	return parts[1], nil
 }
