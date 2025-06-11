@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt"
+	
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -27,13 +29,16 @@ var allowedCategories = []string{"Fiction", "Non-Fiction"}
 type Book struct {
 	ID        uint   `gorm:"primaryKey"`
 	Title     string `gorm:"not null"`
-	Author    string
+	Author    string // Optional author field
+	ContentHash string `gorm:"index"`
 	FilePath  string // Local storage file path.
 	AudioPath string // Path/URL of the generated (merged) audio.
 	Status    string `gorm:"default:'pending'"`
 	Category  string `gorm:"not null;index"`
 	Genre     string `gorm:"index"`
 	UserID    uint   `gorm:"index"`
+	CoverPath string // Optional cover image path
+	CoverURL  string // Optional cover image URL for public access
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -69,14 +74,36 @@ type TTSQueueJob struct {
 	UpdatedAt time.Time
 	UserID    uint `gorm:"index"`
 }
+type BookResponse struct {
+	ID        uint   `json:"id"`
+	Title     string `json:"title"`
+	Author    string `json:"author"`
+	Category  string `json:"category"`
+	ContentHash string `json:"content_hash"`
+	Genre     string `json:"genre"`
+	FilePath  string `json:"file_path"`
+	AudioPath string `json:"audio_path"`
+	Status    string `json:"status"`
+	StreamURL string `json:"stream_url"`
+	CoverURL  string `json:"cover_url"`
+	CoverPath string `json:"cover_path"`
+}
 
 func main() {
+
+	// err := godotenv.Load()
+	// if err != nil {
+	// 	log.Println("⚠️ Could not load .env file, using system env variables")
+	// }
 	// Set up the database connection and run migrations.
 	setupDatabase()
 	startTTSWorker()
 
 	// Initialize Gin router.
 	router := gin.Default()
+
+	// Calling Streaming Route outside of the authorized group
+	// router.GET("/user/books/stream/proxy/:id", proxyBookAudioHandler)
 
 	// Protected routes group.
 	authorized := router.Group("/user")
@@ -85,7 +112,8 @@ func main() {
 		authorized.POST("/books", createBookHandler)
 		authorized.GET("/books", listBooksHandler)
 		authorized.POST("/books/upload", uploadBookFileHandler)
-		authorized.GET("/books/stream/:id", streamBookAudioHandler)
+		// authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
+		authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
 		authorized.POST("/chunks/tts", ProcessChunksTTSHandler)
 		authorized.GET("/chunks/tts/merged-audio/:book_id", streamMergedChunkAudioHandler)
 		authorized.GET("/books/:book_id/chunks/:start/:end/audio", streamChunkGroupAudioHandler)
@@ -213,7 +241,31 @@ func listBooksHandler(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch books", "details": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"books": books})
+
+	//🛡 Add public stream URL to each book
+	streamHost := getEnv("STREAM_HOST", "http://100.110.176.220:8083")
+	if streamHost == "" {
+		log.Println("STREAM_HOST environment variable not set, using default http://100.110.176.220:8083")
+		streamHost = "http://100.110.176.220:8083"
+	}
+	var response []BookResponse
+	for _, book := range books {
+		streamURL := streamHost + "/user/books/stream/proxy/" + fmt.Sprintf("%d", book.ID)
+		response = append(response, BookResponse{
+			ID:        book.ID,
+			Title:     book.Title,
+			Author:    book.Author,
+			Category:  book.Category,
+			Genre:     book.Genre,
+			FilePath:  book.FilePath,
+			AudioPath: book.AudioPath,
+			Status:    book.Status,
+			StreamURL: streamURL,
+			CoverURL:  book.CoverURL,
+			CoverPath: book.CoverPath,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"books": response})
 }
 
 func isValidCategory(category string) bool {
@@ -227,23 +279,41 @@ func isValidCategory(category string) bool {
 
 func authMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		tokenString, err := extractToken(c.GetHeader("Authorization"))
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		var tokenString string
+
+		// Try getting token from Authorization header
+		authHeader := c.GetHeader("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			tokenString = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+
+		// Fallback to query param if header is missing (iOS/AVPlayer)
+		if tokenString == "" {
+			tokenString = c.Query("token")
+		}
+
+		if tokenString == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Missing token"})
 			return
 		}
+
+		// Parse and validate token
 		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, errors.New("unexpected signing method")
-			}
 			return jwtSecretKey, nil
 		})
 		if err != nil || !token.Valid {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
 			return
 		}
-		c.Set("claims", token.Claims)
-		c.Next()
+
+		// Attach claims to context
+		if claims, ok := token.Claims.(jwt.MapClaims); ok {
+			c.Set("claims", claims)
+			c.Next()
+			return
+		}
+
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token claims"})
 	}
 }
 

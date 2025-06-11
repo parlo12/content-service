@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -40,7 +42,17 @@ func processMergedChunks(bookID uint, chunkIDs []uint) error {
 		return fmt.Errorf("failed to write merged text: %w", err)
 	}
 
-	// 4. Combine audio into a single MP3 using FFmpeg concat
+	// 4. Compute content hash of merged text
+	h := sha256.New()
+	h.Write([]byte(mergedText))
+	contentHash := hex.EncodeToString(h.Sum(nil))
+
+	// 5. Save hash in book record
+	if err := db.Model(&Book{}).Where("id = ?", bookID).Update("content_hash", contentHash).Error; err != nil {
+		return fmt.Errorf("failed to save content hash: %w", err)
+	}
+
+	// 6. Combine audio into a single MP3 using FFmpeg concat
 	listFile := fmt.Sprintf("./audio/audio_list_%d.txt", time.Now().Unix())
 	listHandle, err := os.Create(listFile)
 	if err != nil {
@@ -61,15 +73,16 @@ func processMergedChunks(bookID uint, chunkIDs []uint) error {
 		return fmt.Errorf("ffmpeg merge fail: %v\n%s", err, output)
 	}
 
-	// 5. Call sound effects pipeline with temporary Book struct
+	// 7. Call sound effects pipeline with temporary Book struct
 	book := Book{
-		ID:        bookID,
-		FilePath:  textFile,
-		AudioPath: mergedAudio,
+		ID:          bookID,
+		FilePath:    textFile,
+		AudioPath:   mergedAudio,
+		ContentHash: contentHash,
 	}
-	go processSoundEffectsAndMerge(book) // run asynchronously
+	go processSoundEffectsAndMerge(book, contentHash) // run asynchronously
 
-	// 6. Save to processed chunk group table
+	// 8. Save to processed chunk group table
 	if err := saveProcessedChunkGroup(bookID, startIdx, endIdx, mergedAudio); err != nil {
 		return fmt.Errorf("failed to save chunk group metadata: %w", err)
 	}

@@ -37,7 +37,7 @@ func ProcessChunksTTSHandler(c *gin.Context) {
 	var audioPaths []string
 	for _, chunk := range chunks {
 		db.Model(&chunk).Update("TTSStatus", "processing")
-		audioPath, err := convertTextToAudio(chunk.Content)
+		audioPath, err := convertTextToAudio(chunk.Content, chunk.ID)
 		if err != nil {
 			db.Model(&chunk).Update("TTSStatus", "failed")
 			continue

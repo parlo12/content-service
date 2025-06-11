@@ -1,5 +1,11 @@
 package main
 
+// content-service/tts_processing.go
+// this file handles TTS processing using OpenAI's API.
+// It generates SSML from plain text using GPT, then converts that SSML to audio using OpenAI's TTS API.
+// It also checks for existing audio files to avoid redundant processing.
+// It processes books in the database, converting their text content to audio files.
+
 import (
 	"bytes"
 	"encoding/json"
@@ -16,7 +22,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// wrapSSML ensures we always send a single <speak>…</speak> block
 func wrapSSML(text string) string {
 	t := strings.TrimSpace(text)
 	if strings.HasPrefix(t, "<speak") {
@@ -25,30 +30,26 @@ func wrapSSML(text string) string {
 	return "<speak>\n" + t + "\n</speak>"
 }
 
-// openaiTTSEndpoint is the endpoint for generating audio from text using OpenAI's TTS.
 const openaiTTSEndpoint = "https://api.openai.com/v1/audio/speech"
 
-// TTSPayload represents the JSON payload for the OpenAI TTS endpoint.
 type TTSPayload struct {
-	Input          string  `json:"input"`                     // SSML input
-	InputFormat    string  `json:"input_format,omitempty"`    // "ssml or text"
-	Model          string  `json:"model"`                     // e.g. "gpt-4o-mini-tts"
-	Voice          string  `json:"voice"`                     // e.g. "alloy"
-	Instructions   string  `json:"instructions,omitempty"`    // must mention SSML
-	ResponseFormat string  `json:"response_format,omitempty"` // "mp3"
+	Input          string  `json:"input"`
+	InputFormat    string  `json:"input_format,omitempty"`
+	Model          string  `json:"model"`
+	Voice          string  `json:"voice"`
+	Instructions   string  `json:"instructions,omitempty"`
+	ResponseFormat string  `json:"response_format,omitempty"`
 	Speed          float64 `json:"speed,omitempty"`
 }
 
-// generateSSML wraps plain text in expressive SSML (breaks, emphasis, prosody).
-// It asks GPT to produce a single <speak>…</speak> block.
 func generateSSML(rawText string) (string, error) {
 	systemContent := `You are an expressive audiobook narrator.
-					Convert this into SSML:
-					- Use <break time="500ms"/> at natural pauses
-					- Wrap key phrases in <emphasis>
-					- Use <prosody rate="80%">…</prosody> for sad passages
-					- Use <prosody rate="110%">…</prosody> for action passages
-					Output only the SSML wrapped in one <speak>…</speak> block.`
+Convert this into SSML:
+- Use <break time="500ms"/> at natural pauses
+- Wrap key phrases in <emphasis>
+- Use <prosody rate="80%">…</prosody> for sad passages
+- Use <prosody rate="110%">…</prosody> for action passages
+Output only the SSML wrapped in one <speak>…</speak> block.`
 
 	reqBody := ChatRequest{
 		Model: "gpt-4o",
@@ -90,13 +91,6 @@ func generateSSML(rawText string) (string, error) {
 		return "", errors.New("no SSML choices returned")
 	}
 
-	// ssml := strings.TrimSpace(chatResp.Choices[0].Message.Content)
-	// if !strings.HasPrefix(ssml, "<speak") {
-	// 	ssml = "<speak>" + ssml + "</speak>"
-	// }
-	// return ssml, nil
-
-	// clean out any markdown fences that GPT might wrap it in
 	raw := strings.TrimSpace(chatResp.Choices[0].Message.Content)
 	raw = strings.ReplaceAll(raw, "```", "")
 	raw = strings.ReplaceAll(raw, "```ssml", "")
@@ -105,21 +99,17 @@ func generateSSML(rawText string) (string, error) {
 	raw = strings.ReplaceAll(raw, "```xml ssml", "")
 	raw = strings.TrimPrefix(raw, "```")
 	raw = strings.TrimSuffix(raw, "```")
-	// ensure a single <speak>…</speak> block
 	ssml := wrapSSML(raw)
 	log.Printf("SSML: %s", ssml)
 	return ssml, nil
 }
 
-// convertTextToAudio turns plain text into SSML via GPT, then into MP3 via OpenAI TTS.
-func convertTextToAudio(text string) (string, error) {
+func convertTextToAudio(text string, bookID uint) (string, error) {
 	ssml, err := generateSSML(text)
 	if err != nil {
 		return "", fmt.Errorf("SSML generation failed: %w", err)
 	}
-	// ensure all breaks/emphasis/etc. are inside a single <speak>…</speak> block
 	ssml = wrapSSML(ssml)
-	log.Printf("SSML: %s", ssml)
 
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	if apiKey == "" {
@@ -130,7 +120,7 @@ func convertTextToAudio(text string) (string, error) {
 		Input:          ssml,
 		Model:          "gpt-4o-mini-tts",
 		Voice:          "alloy",
-		Instructions:   "Interpret the input as SSML: apply breaks, prosody and emphasis tags but do not speak them.",
+		Instructions:   "Interpret SSML with breaks, prosody, emphasis. Do not speak tags.",
 		ResponseFormat: "mp3",
 		Speed:          1.0,
 	}
@@ -142,7 +132,7 @@ func convertTextToAudio(text string) (string, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
-	// increase timeout to 120 seconds for longer books
+
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -158,7 +148,8 @@ func convertTextToAudio(text string) (string, error) {
 	if err := os.MkdirAll("./audio", 0755); err != nil {
 		return "", err
 	}
-	filename := fmt.Sprintf("audio_%d.mp3", time.Now().Unix())
+
+	filename := fmt.Sprintf("audio_%d.mp3", bookID)
 	path := "./audio/" + filename
 
 	outFile, err := os.Create(path)
@@ -173,62 +164,73 @@ func convertTextToAudio(text string) (string, error) {
 	return path, nil
 }
 
-// processBookConversion reads the book, TTS-converts it and kicks off sound-effects.
 func processBookConversion(book Book) {
-	// 0) if another user already processed the same title+author, just reuse that audio:
+	// 0) Ensure file exists
+	if _, err := os.Stat(book.FilePath); os.IsNotExist(err) {
+		log.Printf("🚫 File does not exist for book ID %d: %s", book.ID, book.FilePath)
+		updateBookStatus(book.ID, "failed")
+		return
+	}
+
+	// 1) Compute content hash if not already stored
+	if book.ContentHash == "" {
+		hash, err := computeFileHash(book.FilePath)
+		if err != nil {
+			log.Printf("❌ Failed to compute content hash for book ID %d: %v", book.ID, err)
+			updateBookStatus(book.ID, "failed")
+			return
+		}
+		book.ContentHash = hash
+		if err := db.Model(&Book{}).Where("id = ?", book.ID).Update("content_hash", hash).Error; err != nil {
+			log.Printf("⚠️ Failed to save content hash: %v", err)
+		}
+	}
+
+	// 2) Check if audio already exists for this content hash
 	var dup Book
-	err := db.
-		Where("title = ? AND author = ? AND audio_path IS NOT NULL AND audio_path <> ''",
-			book.Title, book.Author).
-		First(&dup).Error
+	err := db.Where("content_hash = ? AND audio_path IS NOT NULL AND audio_path <> ''", book.ContentHash).First(&dup).Error
 	if err == nil {
-		log.Printf("Reusing existing audio for '%s' by %s → %s", book.Title, book.Author, dup.AudioPath)
-		book.AudioPath = dup.AudioPath
-		book.Status = "TTS reused"
-		if err := db.Save(&book).Error; err != nil {
-			log.Printf("Error saving reused audio for book ID %d: %v", book.ID, err)
+		log.Printf("🔁 Reusing audio from book ID %d for book ID %d", dup.ID, book.ID)
+		if err := db.Model(&Book{}).Where("id = ?", book.ID).Updates(Book{
+			AudioPath: dup.AudioPath,
+			Status:    "TTS reused",
+		}).Error; err != nil {
+			log.Printf("⚠️ Error saving reused audio for book ID %d: %v", book.ID, err)
 		}
 		return
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		// some other DB error
-		log.Printf("Error checking for existing audio: %v", err)
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		log.Printf("⚠️ Error checking for existing audio: %v", err)
 	}
 
-	// 1) Check file exists...
-	if _, err := os.Stat(book.FilePath); os.IsNotExist(err) {
-		log.Printf("File does not exist for book ID %d: %s", book.ID, book.FilePath)
-		updateBookStatus(book.ID, "failed")
-		return
-	}
-
-	// 2) Read the file content
+	// 3) Read file content
 	contentBytes, err := os.ReadFile(book.FilePath)
 	if err != nil {
-		log.Printf("Error reading file for book ID %d: %v", book.ID, err)
+		log.Printf("📛 Error reading file for book ID %d: %v", book.ID, err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
 
-	// 3) Generate TTS
-	ttsPath, err := convertTextToAudio(string(contentBytes))
+	// 4) Convert to TTS
+	ttsPath, err := convertTextToAudio(string(contentBytes), book.ID)
 	if err != nil {
-		log.Printf("Error converting text to audio for book ID %d: %v", book.ID, err)
+		log.Printf("🎙️ Error converting text to audio for book ID %d: %v", book.ID, err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
-	log.Printf("TTS audio file generated at: %s for book ID %d", ttsPath, book.ID)
+	log.Printf("✅ TTS audio file generated: %s for book ID %d", ttsPath, book.ID)
 
-	// 4) Save and mark complete
-	book.AudioPath = ttsPath
-	book.Status = "TTS completed"
-	if err := db.Save(&book).Error; err != nil {
-		log.Printf("Error updating book record for book ID %d: %v", book.ID, err)
+	// 5) Save TTS result before adding effects
+	if err := db.Model(&Book{}).Where("id = ?", book.ID).Updates(map[string]interface{}{
+		"audio_path": ttsPath,
+		"status":     "TTS completed",
+	}).Error; err != nil {
+		log.Printf("⚠️ Error updating TTS result for book ID %d: %v", book.ID, err)
 		return
 	}
 
-	// 5) Kick off SFX merge
-	go processSoundEffectsAndMerge(book)
+	// 6) Launch sound effects and merging in the background
+	log.Printf("🚀 Launching effects merge with hash: %s for book ID %d", book.ContentHash, book.ID)
+	go processSoundEffectsAndMerge(book, book.ContentHash)
 }
 
 // adding this comment to check if my deployment works
@@ -240,8 +242,8 @@ func updateBookStatus(bookID uint, status string) {
 		log.Printf("Error finding book with ID %d: %v", bookID, err)
 		return
 	}
-	book.Status = status
-	if err := db.Save(&book).Error; err != nil {
-		log.Printf("Error updating status for book ID %d: %v", bookID, err)
+
+	if err := db.Model(&Book{}).Where("id = ?", book.ID).Update("status", status).Error; err != nil {
+		log.Printf("Error updating status for book ID %d: %v", book.ID, err)
 	}
 }

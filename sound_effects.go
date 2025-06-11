@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -19,33 +21,25 @@ import (
 // -------------------- constants & types --------------------
 
 const (
-	// ElevenLabs fixed-22s music endpoint
 	elevenLabsSoundEffectsURL = "https://api.elevenlabs.io/v1/sound-generation"
-	// OpenAI ChatGPT endpoint for segmentation & event extraction
-	openAIChatURL = "https://api.openai.com/v1/chat/completions"
+	openAIChatURL             = "https://api.openai.com/v1/chat/completions"
 )
 
-// Segment is one slice of the dynamic background track.
 type Segment struct {
-	Start float64 `json:"start"` // seconds into TTS
-	End   float64 `json:"end"`   // seconds into TTS
-	Mood  string  `json:"mood"`  // "suspense", "action", etc.
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+	Mood  string  `json:"mood"`
 }
 
-// EventMap maps each event name to the timestamps where it occurs.
 type EventMap map[string][]float64
 
-// SoundEffectRequest is the ElevenLabs sound-generation payload.
 type SoundEffectRequest struct {
 	Text            string  `json:"text"`
 	DurationSeconds float64 `json:"duration_seconds,omitempty"`
 	PromptInfluence float64 `json:"prompt_influence,omitempty"`
 }
 
-// effectCache prevents re-requesting the same Foley over and over.
 var effectCache = map[string]string{}
-
-// effectPrompts holds human-friendly prompts for known event types.
 var effectPrompts = map[string]string{
 	"sword_clash": "Short metallic sword clash, bright ring, about 2 seconds.",
 	"door_creak":  "Wooden door creaking open, slow, about 2 seconds.",
@@ -55,7 +49,8 @@ var effectPrompts = map[string]string{
 // -------------------- background music pipeline --------------------
 
 // generateSoundEffect fetches one 22s music clip from ElevenLabs.
-func generateSoundEffect(prompt string) (string, error) {
+
+func generateSoundEffect(prompt string, id ...interface{}) (string, error) {
 	apiKey := os.Getenv("XI_API_KEY")
 	if apiKey == "" {
 		return "", errors.New("XI_API_KEY not set")
@@ -80,7 +75,12 @@ func generateSoundEffect(prompt string) (string, error) {
 
 	data, _ := io.ReadAll(resp.Body)
 	os.MkdirAll("./audio", 0755)
-	out := fmt.Sprintf("./sound_effect_%d.mp3", time.Now().Unix())
+	var out string
+	if len(id) > 0 {
+		out = fmt.Sprintf("./audio/sound_effect_%v.mp3", id[0])
+	} else {
+		out = "./audio/sound_effect.mp3"
+	}
 	if err := os.WriteFile(out, data, 0644); err != nil {
 		return "", fmt.Errorf("write sound file: %w", err)
 	}
@@ -125,11 +125,8 @@ func generateSegmentInstructions(ttsDur float64, bookPath string) ([]Segment, er
 	num := int(math.Ceil(ttsDur / 22.0))
 
 	prompt := fmt.Sprintf(`You are an audio segmentation assistant.
-Given TTS duration of %.2f seconds and this excerpt:
-
-%s
-
-Output ONLY a JSON array of %d segments with keys "start", "end", and "mood" (one of "suspense","action","climax","sad","neutral"), no extras.`, ttsDur, summary, num)
+		Given TTS duration of %.2f seconds and this excerpt:%sOutput 
+		ONLY a JSON array of %d segments with keys "start", "end", and "mood" (one of "suspense","action","climax","sad","neutral"), no extras.`, ttsDur, summary, num)
 
 	reqBody := map[string]interface{}{
 		"model":       "gpt-4o",
@@ -245,39 +242,37 @@ func generateDynamicBackgroundWithSegments(ttsDur float64, bgPath string, segs [
 	return finalBg, nil
 }
 
+func computeContentHash(filePath string) (string, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum), nil
+}
+
 // mergeAudio overlays TTS narration with the dynamic background.
-func mergeAudio(ttsPath, bgPath, bookPath string) (string, error) {
-	// get TTS duration
-	out, err := exec.Command("ffprobe", "-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=noprint_wrappers=1:nokey=1",
-		ttsPath).Output()
+
+func mergeAudio(ttsPath, bgPath string, book Book, bookPath string, hash string) (string, error) {
+	out, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", ttsPath).Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe: %w", err)
 	}
 	dur, _ := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
 	log.Printf("TTS duration: %.2f", dur)
 
-	// segmentation
 	segs, err := generateSegmentInstructions(dur, bookPath)
 	if err != nil {
 		return "", err
 	}
-
-	// build dynamic bg
 	dynBg, err := generateDynamicBackgroundWithSegments(dur, bgPath, segs)
 	if err != nil {
 		return "", err
 	}
 
-	// **TURN DOWN MUSIC BEFORE MIXING**
-	outFile := "./merged_output.ogg"
+	outFile := fmt.Sprintf("./merged_output_%d_%s.ogg", book.ID, hash[:8])
 	filterComplex := "[1]volume=0.30[bg];[0][bg]amix=inputs=2:duration=first:dropout_transition=2"
-	cmd := exec.Command("ffmpeg", "-y",
-		"-i", ttsPath, "-i", dynBg,
-		"-filter_complex", filterComplex,
-		"-c:a", "libopus", "-b:a", "64k", outFile,
-	)
+	cmd := exec.Command("ffmpeg", "-y", "-i", ttsPath, "-i", dynBg, "-filter_complex", filterComplex, "-c:a", "libopus", "-b:a", "64k", outFile)
 	if o, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("ffmpeg merge: %v\n%s", err, o)
 	}
@@ -319,12 +314,7 @@ func extractSoundEvents(bookPath string, ttsDur float64) (EventMap, error) {
 		sn = sn[:500]
 	}
 
-	prompt := fmt.Sprintf(`You are an audio event assistant.
-Given TTS duration of %.2f seconds and this excerpt:
-
-%s
-
-Identify distinct event types (e.g. "sword_clash","door_creak") and output ONLY a JSON object mapping each event to an array of timestamps.`, ttsDur, sn)
+	prompt := fmt.Sprintf(`You are an audio event assistant.Given TTS duration of %.2f seconds and this excerpt:%sIdentify distinct event types (e.g. "sword_clash","door_creak") and output ONLY a JSON object mapping each event to an array of timestamps.`, ttsDur, sn)
 
 	reqBody := map[string]interface{}{
 		"model": "gpt-4o",
@@ -364,7 +354,7 @@ Identify distinct event types (e.g. "sword_clash","door_creak") and output ONLY 
 
 	rawC := strings.TrimSpace(ch.Choices[0].Message.Content)
 	rawC = strings.TrimPrefix(rawC, "```json")
-	rawC = strings.Trim(rawC, "```")
+	rawC = strings.Trim(rawC, "`")
 	rawC = strings.TrimSpace(rawC)
 
 	var ev EventMap
@@ -381,9 +371,9 @@ func getOrGenerateEffect(eventType string) (string, error) {
 	}
 	prompt, ok := effectPrompts[eventType]
 	if !ok {
-		prompt = fmt.Sprintf("Realistic sound of %s, about 2 seconds.", strings.ReplaceAll(eventType, "_", " "))
+		prompt = fmt.Sprintf("Sound effect for event: %s, about 2 seconds.", eventType)
 	}
-	path, err := generateSoundEffect(prompt)
+	path, err := generateSoundEffect(prompt, eventType)
 	if err != nil {
 		return "", err
 	}
@@ -391,54 +381,51 @@ func getOrGenerateEffect(eventType string) (string, error) {
 	return path, nil
 }
 
-// overlaySoundEvents mixes baseMix + all delayed event clips in one pass.
-func overlaySoundEvents(baseMix string, events EventMap) (string, error) {
-	args := []string{"-y", "-i", baseMix}
-	var filters, labels []string
-	inputIdx := 1
-
-	// for each event & timestamp, delay + volume-scale and collect labels
-	for evt, times := range events {
-		clip, err := getOrGenerateEffect(evt)
-		if err != nil {
-			log.Printf("warning: %s clip error: %v", evt, err)
-			continue
-		}
-		args = append(args, "-i", clip)
-		for j, t := range times {
-			d := int(t * 1000)
-			inLbl := fmt.Sprintf("[%d:a]", inputIdx)
-			outLbl := fmt.Sprintf("[e%d_%d]", inputIdx, j)
-			// *** FIX: delay + lower SFX to 20% so TTS stays clear
-			filters = append(filters,
-				fmt.Sprintf("%sadelay=%d|%d,volume=0.45%s", inLbl, d, d, outLbl),
-			)
-			labels = append(labels, outLbl)
-		}
-		inputIdx++
-	}
-
-	// now amix them all: start with base "[0:a]" then each delayed label
-	amixIn := "[0:a]" + strings.Join(labels, "")
-	totalIn := 1 + len(labels)
-	filters = append(filters,
-		fmt.Sprintf("%samix=inputs=%d:duration=first:dropout_transition=0", amixIn, totalIn),
-	)
-
-	outFile := "./final_with_fx.ogg"
-	args = append(args, "-filter_complex", strings.Join(filters, ";"), "-c:a", "libopus", "-b:a", "64k", outFile)
-
-	if o, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
-		return "", fmt.Errorf("overlaySoundEvents FFmpeg fail: %v\n%s", err, o)
-	}
-	return outFile, nil
-}
-
 // -------------------- orchestration --------------------
 
 // processSoundEffectsAndMerge now also injects background Foley.
-func processSoundEffectsAndMerge(book Book) {
-	// 1) overall music → 22s clip
+func processSoundEffectsAndMerge(book Book, hash string) {
+
+	if book.ContentHash == "" && hash != "" {
+		book.ContentHash = hash
+		db.Model(&Book{}).Where("id = ?", book.ID).Update("content_hash", hash)
+	}
+	// Ensure audio_path is set
+
+	if book.AudioPath == "" {
+		log.Printf("🚫 No audio_path set for book ID %d, skipping sound effects processing", book.ID)
+		return
+	}
+
+	// Ensure file exists
+	if _, err := os.Stat(book.FilePath); os.IsNotExist(err) {
+		log.Printf("🚫 File does not exist for book ID %d: %s", book.ID, book.FilePath)
+		return
+	}
+	// Ensure audio file exists
+	if _, err := os.Stat(book.AudioPath); os.IsNotExist(err) {
+		log.Printf("🚫 Audio file does not exist for book ID %d: %s", book.ID, book.AudioPath)
+		updateBookStatus(book.ID, "failed")
+		return
+	}
+	// Ensure content hash is set
+
+	if book.ContentHash == "" {
+		log.Println("⚠️ Book ContentHash is still empty — fallback reuse may not work properly")
+	}
+	// Check for existing processed audio with same content hash
+	var existing Book
+	err := db.Where("content_hash = ? AND audio_path IS NOT NULL AND status = 'completed'", book.ContentHash).First(&existing).Error
+	if err == nil {
+		log.Printf("🎵 Reusing audio from book ID %d for book ID %d", existing.ID, book.ID)
+		db.Model(&Book{}).Where("id = ?", book.ID).Updates(map[string]interface{}{
+			"audio_path": existing.AudioPath,
+			"status":     "completed (reused)",
+		})
+		return
+	}
+
+	// 1) Generate background music prompt
 	prompt, err := generateOverallSoundPrompt(book.FilePath)
 	if err != nil {
 		log.Printf("prompt err: %v", err)
@@ -452,23 +439,24 @@ func processSoundEffectsAndMerge(book Book) {
 		return
 	}
 
-	// 2) stretch & mix music + TTS
-	baseMix, err := mergeAudio(book.AudioPath, bg, book.FilePath)
+	log.Printf("🎶 Background music generated: %s", bg)
+
+	// 2) Mix TTS with background
+	baseMix, err := mergeAudio(book.AudioPath, bg, book, book.FilePath, hash)
 	if err != nil {
 		log.Printf("mergeAudio err: %v", err)
 		updateBookStatus(book.ID, "failed")
 		return
 	}
 
-	// 3) extract events
+	// 3) Extract events and overlay
 	ttsDur, _ := getTTSDuration(book.AudioPath)
 	events, err := extractSoundEvents(book.FilePath, ttsDur)
 	if err != nil {
 		log.Printf("extractSoundEvents warning: %v", err)
 		book.AudioPath = baseMix
 	} else {
-		// 4) overlay Foley
-		fxMix, err := overlaySoundEvents(baseMix, events)
+		fxMix, err := overlaySoundEvents(baseMix, events, book)
 		if err != nil {
 			log.Printf("overlaySoundEvents warning: %v", err)
 			book.AudioPath = baseMix
@@ -477,10 +465,62 @@ func processSoundEffectsAndMerge(book Book) {
 		}
 	}
 
-	// 5) save
-	if err := db.Save(&book).Error; err != nil {
-		log.Printf("db save err: %v", err)
+	// 4) Save and cleanup
+	if err := db.Model(&Book{}).Where("id = ?", book.ID).Updates(map[string]interface{}{
+		"audio_path": book.AudioPath,
+		"status":     "completed",
+	}).Error; err != nil {
+		log.Printf("db update err: %v", err)
 	} else {
-		log.Printf("Book %d processed → %s", book.ID, book.AudioPath)
+		log.Printf("✅ Book %d updated with audio_path → %s", book.ID, book.AudioPath)
 	}
+	cleanupTempFiles(book.ID)
+}
+
+// overlaySoundEvents updated to accept book
+func overlaySoundEvents(baseMix string, events EventMap, book Book) (string, error) {
+	safeTitle := strings.ReplaceAll(strings.ToLower(book.Title), " ", "_")
+	hashSuffix := book.ContentHash[:8]
+	outFile := fmt.Sprintf("./final_with_fx_%s_%d_%s.ogg", safeTitle, book.ID, hashSuffix)
+
+	args := []string{"-y", "-i", baseMix}
+	var filters, labels []string
+	inputIdx := 1
+
+	for evt, times := range events {
+		clip, err := getOrGenerateEffect(evt)
+		if err != nil {
+			log.Printf("warning: %s clip error: %v", evt, err)
+			continue
+		}
+		args = append(args, "-i", clip)
+		for j, t := range times {
+			d := int(t * 1000)
+			inLbl := fmt.Sprintf("[%d:a]", inputIdx)
+			outLbl := fmt.Sprintf("[e%d_%d]", inputIdx, j)
+			filters = append(filters, fmt.Sprintf("%sadelay=%d|%d,volume=0.45%s", inLbl, d, d, outLbl))
+			labels = append(labels, outLbl)
+		}
+		inputIdx++
+	}
+	amixIn := "[0:a]" + strings.Join(labels, "")
+	totalIn := 1 + len(labels)
+	filters = append(filters, fmt.Sprintf("%samix=inputs=%d:duration=first:dropout_transition=0", amixIn, totalIn))
+
+	args = append(args, "-filter_complex", strings.Join(filters, ";"), "-c:a", "libopus", "-b:a", "64k", outFile)
+
+	if o, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
+		return "", fmt.Errorf("overlaySoundEvents FFmpeg fail: %v\n%s", err, o)
+	}
+	return outFile, nil
+}
+
+// cleanupTempFiles removes dynamic segments and lists
+func cleanupTempFiles(_ uint) {
+	pattern := "dyn_seg_*.ogg"
+	matches, _ := filepath.Glob(pattern)
+	for _, file := range matches {
+		os.Remove(file)
+	}
+	os.Remove("dyn_list.txt")
 }
