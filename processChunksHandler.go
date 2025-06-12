@@ -11,24 +11,27 @@ import (
 
 func ProcessChunksTTSHandler(c *gin.Context) {
 	var req struct {
-		ChunkIDs []uint `json:"chunk_ids"`
+		BookID uint  `json:"book_id"`
+		Pages  []int `json:"pages"` // 1-based page numbers
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || len(req.ChunkIDs) == 0 || len(req.ChunkIDs) > 2 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "You must select 1 or 2 chunk_ids"})
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Pages) == 0 || len(req.Pages) > 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "You must provide 1 or 2 pages to process"})
 		return
 	}
 
+	// Convert pages (index + 1) to chunk indices for the specific book
 	var chunks []BookChunk
-	if err := db.Where("id IN ?", req.ChunkIDs).Find(&chunks).Error; err != nil || len(chunks) != len(req.ChunkIDs) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid chunk IDs"})
+	if err := db.Where("book_id = ? AND index IN ?", req.BookID, toZeroBasedIndexes(req.Pages)).
+		Order("index ASC").
+		Find(&chunks).Error; err != nil || len(chunks) != len(req.Pages) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid page numbers for the given book_id"})
 		return
 	}
 
-	// Ensure all chunks belong to same book
-	bookID := chunks[0].BookID
+	// Ensure no chunk has been processed yet
 	for _, ch := range chunks {
-		if ch.BookID != bookID || ch.TTSStatus == "completed" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Chunks must be from same book and not already processed"})
+		if ch.TTSStatus == "completed" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "One or more pages already processed"})
 			return
 		}
 	}
@@ -48,13 +51,30 @@ func ProcessChunksTTSHandler(c *gin.Context) {
 		audioPaths = append(audioPaths, audioPath)
 	}
 
+	// Attempt to merge (optional)
+	err := processMergedChunks(req.BookID, extractIDs(chunks))
+	if err != nil {
+		log.Printf("merge processing failed: %v", err)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":     "TTS processing complete",
 		"audio_paths": audioPaths,
 	})
+}
 
-	err := processMergedChunks(bookID, req.ChunkIDs)
-	if err != nil {
-		log.Printf("merge processing failed: %v", err)
+func toZeroBasedIndexes(pages []int) []int {
+	indices := make([]int, len(pages))
+	for i, p := range pages {
+		indices[i] = p - 1
 	}
+	return indices
+}
+
+func extractIDs(chunks []BookChunk) []uint {
+	ids := make([]uint, len(chunks))
+	for i, ch := range chunks {
+		ids[i] = ch.ID
+	}
+	return ids
 }

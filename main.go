@@ -6,12 +6,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt"
-	
+
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -27,20 +28,21 @@ var allowedCategories = []string{"Fiction", "Non-Fiction"}
 
 // Book represents the model for a book uploaded by a user.
 type Book struct {
-	ID        uint   `gorm:"primaryKey"`
-	Title     string `gorm:"not null"`
-	Author    string // Optional author field
+	ID          uint   `gorm:"primaryKey"`
+	Title       string `gorm:"not null"`
+	Author      string // Optional author field
+	Content     string `gorm:"type:text"` // Text content of the book
 	ContentHash string `gorm:"index"`
-	FilePath  string // Local storage file path.
-	AudioPath string // Path/URL of the generated (merged) audio.
-	Status    string `gorm:"default:'pending'"`
-	Category  string `gorm:"not null;index"`
-	Genre     string `gorm:"index"`
-	UserID    uint   `gorm:"index"`
-	CoverPath string // Optional cover image path
-	CoverURL  string // Optional cover image URL for public access
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	FilePath    string // Local storage file path.
+	AudioPath   string // Path/URL of the generated (merged) audio.
+	Status      string `gorm:"default:'pending'"`
+	Category    string `gorm:"not null;index"`
+	Genre       string `gorm:"index"`
+	UserID      uint   `gorm:"index"`
+	CoverPath   string // Optional cover image path
+	CoverURL    string // Optional cover image URL for public access
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // BookRequest defines the expected JSON structure for creating a book.
@@ -75,18 +77,19 @@ type TTSQueueJob struct {
 	UserID    uint `gorm:"index"`
 }
 type BookResponse struct {
-	ID        uint   `json:"id"`
-	Title     string `json:"title"`
-	Author    string `json:"author"`
-	Category  string `json:"category"`
+	ID          uint   `json:"id"`
+	Title       string `json:"title"`
+	Author      string `json:"author"`
+	Category    string `json:"category"`
+	Content     string `json:"content,omitempty"` // Optional, can be omitted for public response
 	ContentHash string `json:"content_hash"`
-	Genre     string `json:"genre"`
-	FilePath  string `json:"file_path"`
-	AudioPath string `json:"audio_path"`
-	Status    string `json:"status"`
-	StreamURL string `json:"stream_url"`
-	CoverURL  string `json:"cover_url"`
-	CoverPath string `json:"cover_path"`
+	Genre       string `json:"genre"`
+	FilePath    string `json:"file_path"`
+	AudioPath   string `json:"audio_path"`
+	Status      string `json:"status"`
+	StreamURL   string `json:"stream_url"`
+	CoverURL    string `json:"cover_url"`
+	CoverPath   string `json:"cover_path"`
 }
 
 func main() {
@@ -112,6 +115,7 @@ func main() {
 		authorized.POST("/books", createBookHandler)
 		authorized.GET("/books", listBooksHandler)
 		authorized.POST("/books/upload", uploadBookFileHandler)
+		authorized.GET("/books/:book_id/chunks/pages", listBookPagesHandler) // New handler for listing book pages
 		// authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
 		authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
 		authorized.POST("/chunks/tts", ProcessChunksTTSHandler)
@@ -207,6 +211,98 @@ func createBookHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Book saved", "book": book})
 }
 
+// adding a new handler for listing book pages
+func listBookPagesHandler(c *gin.Context) {
+	bookID := c.Param("book_id")
+	if bookID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Book ID is required"})
+		return
+	}
+
+	// Optional pagination
+	limit := 20 // default limit
+	offset := 0
+
+	if l := c.Query("limit"); l != "" {
+		if parsedLimit, err := strconv.Atoi(l); err == nil && parsedLimit > 0 {
+			limit = parsedLimit
+		}
+	}
+	if o := c.Query("offset"); o != "" {
+		if parsedOffset, err := strconv.Atoi(o); err == nil && parsedOffset >= 0 {
+			offset = parsedOffset
+		}
+	}
+
+	// Fetch the book itself for metadata
+	var book Book
+	if err := db.First(&book, bookID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		return
+	}
+
+	// Fetch chunks for this book with pagination
+	var chunks []BookChunk
+	if err := db.Where("book_id = ?", bookID).
+		Order("index ASC").
+		Limit(limit).
+		Offset(offset).
+		Find(&chunks).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not retrieve book chunks", "details": err.Error()})
+		return
+	}
+
+	if len(chunks) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"message": "No pages found for this range"})
+		return
+	}
+
+	// Check processed status and prepare pages
+	pages := make([]map[string]interface{}, 0, len(chunks))
+	fullyProcessed := true
+
+	for _, chunk := range chunks {
+		if chunk.TTSStatus != "completed" {
+			fullyProcessed = false
+		}
+		pages = append(pages, map[string]interface{}{
+			"page":      chunk.Index + 1,
+			"content":   chunk.Content,
+			"status":    chunk.TTSStatus,
+			"audio_url": chunk.AudioPath,
+		})
+	}
+
+	// Total page count (optional, could cache later for large scale)
+	var totalChunks int64
+	db.Model(&BookChunk{}).Where("book_id = ?", bookID).Count(&totalChunks)
+
+	// Send JSON response
+	c.JSON(http.StatusOK, gin.H{
+		"book_id":         book.ID,
+		"title":           book.Title,
+		"status":          book.Status,
+		"total_pages":     totalChunks,
+		"limit":           limit,
+		"offset":          offset,
+		"fully_processed": fullyProcessed,
+		"pages":           pages,
+	})
+}
+
+// listBooksHandler retrieves all books for the authenticated user, optionally filtering by category and genre.
+// It returns a list of books with their details, including a public stream URL for each book.
+// It expects the user to be authenticated via JWT token.
+// The token should contain user_id in its claims.
+// If the user_id is not found in the token, it returns an error.
+// If the category or genre is provided, it filters the books accordingly.
+// If the category is invalid, it returns an error.
+// It also adds a public stream URL to each book in the response.
+// If the database query fails, it returns an error with details.
+// The stream URL is constructed using the STREAM_HOST environment variable, defaulting to "http://100.110.176.220:8083"
+// If the STREAM_HOST environment variable is not set, it uses the default value.
+// It returns a JSON response with the list of books, each containing its ID, title, author, category, genre, file path, audio path, status, stream URL, cover URL, and cover path.
+// It uses the Gin framework for handling HTTP requests and responses.
 func listBooksHandler(c *gin.Context) {
 	claims, exists := c.Get("claims")
 	if !exists {
