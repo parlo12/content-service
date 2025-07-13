@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 
@@ -30,4 +31,34 @@ func streamMergedChunkAudioHandler(c *gin.Context) {
 	audioPath := matches[len(matches)-1]
 	c.Header("Content-Type", "audio/mpeg")
 	c.File(audioPath)
+}
+
+func streamSinglePageAudioHandler(c *gin.Context) {
+	bookIDStr := c.Param("book_id")
+	pageStr := c.Param("page")
+
+	bookID, err1 := strconv.Atoi(bookIDStr)
+	pageIndex, err2 := strconv.Atoi(pageStr)
+
+	if err1 != nil || err2 != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid book ID or page number"})
+		return
+	}
+
+	// 🔁 Match new pattern with hash suffix
+	var finalPath string
+	err := db.Table("book_chunks").
+		Select("final_audio_path").
+		Where("book_id = ? AND \"index\" = ?", bookID, pageIndex).
+		Take(&finalPath).Error
+	if err != nil || finalPath == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Final audio not available for this page"})
+		return
+	}
+	if _, err := os.Stat(finalPath); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Audio file missing on disk"})
+		return
+	}
+	c.Header("Content-Type", "audio/mpeg")
+	c.File(finalPath)
 }

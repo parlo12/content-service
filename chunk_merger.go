@@ -13,18 +13,25 @@ import (
 
 // processMergedChunks combines TTS audio and text from selected chunks
 // then runs the sound effects pipeline.
-func processMergedChunks(bookID uint, chunkIDs []uint) error {
-	// 1. Fetch the chunks
+func processMergedChunks(bookID uint) error {
+	// 1. Fetch all completed chunks for the book, ordered by index
 	var chunks []BookChunk
-	if err := db.Where("id IN ?", chunkIDs).Order("index").Find(&chunks).Error; err != nil {
+	if err := db.Where("book_id = ? AND tts_status = ?", bookID, "completed").
+		Order("index").
+		Find(&chunks).Error; err != nil {
 		return fmt.Errorf("failed to fetch chunks: %w", err)
 	}
 	if len(chunks) == 0 {
-		return fmt.Errorf("no chunks found")
+		return fmt.Errorf("no completed chunks found for book %d", bookID)
 	}
 
 	startIdx := chunks[0].Index
 	endIdx := chunks[len(chunks)-1].Index
+
+	var pageIndexes []int
+	for _, ch := range chunks {
+		pageIndexes = append(pageIndexes, ch.Index)
+	}
 
 	// 2. Check if already processed
 	if existingPath, found := checkIfChunkGroupProcessed(bookID, startIdx, endIdx); found {
@@ -80,7 +87,8 @@ func processMergedChunks(bookID uint, chunkIDs []uint) error {
 		AudioPath:   mergedAudio,
 		ContentHash: contentHash,
 	}
-	go processSoundEffectsAndMerge(book, contentHash) // run asynchronously
+
+	go processSoundEffectsAndMerge(book, contentHash, pageIndexes) // Page index is not used in this context
 
 	// 8. Save to processed chunk group table
 	if err := saveProcessedChunkGroup(bookID, startIdx, endIdx, mergedAudio); err != nil {

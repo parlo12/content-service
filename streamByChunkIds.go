@@ -95,9 +95,9 @@ func startTTSWorker() {
 					time.Sleep(5 * time.Second)
 					continue
 				}
-				chunkIDs := parseChunkIDs(job.ChunkIDs)
+				// chunkIDs := parseChunkIDs(job.ChunkIDs) // Removed unused variable
 				db.Model(&job).Update("status", "processing")
-				err := processMergedChunks(job.BookID, chunkIDs)
+				err := processMergedChunks(job.BookID)
 				if err != nil {
 					db.Model(&job).Update("status", "failed")
 					continue

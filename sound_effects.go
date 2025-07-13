@@ -166,14 +166,6 @@ func generateSegmentInstructions(ttsDur float64, bookPath string) ([]Segment, er
 		return fallbackSegments(ttsDur), nil
 	}
 
-	// clean JSON
-	// c := strings.TrimSpace(cr.Choices[0].Message.Content)
-	// c = strings.TrimPrefix(c, "```json")
-	// c = strings.Trim(c, "```")
-	// if !strings.HasSuffix(c, "]") {
-	// 	c += "]"
-	// }
-
 	// ---- NEW CLEANUP LOGIC ----
 	trimmed := cr.Choices[0].Message.Content
 	trimmed = strings.TrimSpace(trimmed)
@@ -226,12 +218,12 @@ func generateDynamicBackgroundWithSegments(ttsDur float64, bgPath string, segs [
 	}
 	f.Close()
 
-	staged := "./dynamic_bg_staged.ogg"
+	staged := "./audio/dynamic_bg_staged.ogg"
 	if o, err := exec.Command("ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list, "-c", "copy", staged).CombinedOutput(); err != nil {
 		return "", fmt.Errorf("concat fail: %v\n%s", err, o)
 	}
 
-	finalBg := "./dynamic_background_final.ogg"
+	finalBg := "./audio/dynamic_background_final.ogg"
 	if o, err := exec.Command("ffmpeg", "-y", "-i", staged,
 		"-af", fmt.Sprintf("atrim=duration=%.2f", ttsDur),
 		"-c:a", "libopus", "-b:a", "64k",
@@ -253,7 +245,7 @@ func computeContentHash(filePath string) (string, error) {
 
 // mergeAudio overlays TTS narration with the dynamic background.
 
-func mergeAudio(ttsPath, bgPath string, book Book, bookPath string, hash string) (string, error) {
+func mergeAudio(ttsPath, bgPath string, book Book, pageIndex int, bookPath string, hash string) (string, error) {
 	out, err := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", ttsPath).Output()
 	if err != nil {
 		return "", fmt.Errorf("ffprobe: %w", err)
@@ -270,9 +262,18 @@ func mergeAudio(ttsPath, bgPath string, book Book, bookPath string, hash string)
 		return "", err
 	}
 
-	outFile := fmt.Sprintf("./merged_output_%d_%s.ogg", book.ID, hash[:8])
-	filterComplex := "[1]volume=0.30[bg];[0][bg]amix=inputs=2:duration=first:dropout_transition=2"
-	cmd := exec.Command("ffmpeg", "-y", "-i", ttsPath, "-i", dynBg, "-filter_complex", filterComplex, "-c:a", "libopus", "-b:a", "64k", outFile)
+	outFile := fmt.Sprintf("./audio/book_%d_page_%d_%s.mp3", book.ID, pageIndex, hash[:8])
+	filterComplex := "[0:a]volume=1.0[a0];[1:a]volume=0.3[a1];[a0][a1]amix=inputs=2:duration=longest[aout]"
+
+	cmd := exec.Command("ffmpeg", "-y",
+		"-i", ttsPath,
+		"-i", dynBg,
+		"-filter_complex", filterComplex,
+		"-map", "[aout]",
+		"-c:a", "libmp3lame",
+		"-q:a", "2",
+		outFile,
+	)
 	if o, err := cmd.CombinedOutput(); err != nil {
 		return "", fmt.Errorf("ffmpeg merge: %v\n%s", err, o)
 	}
@@ -384,104 +385,80 @@ func getOrGenerateEffect(eventType string) (string, error) {
 // -------------------- orchestration --------------------
 
 // processSoundEffectsAndMerge now also injects background Foley.
-func processSoundEffectsAndMerge(book Book, hash string) {
-
+func processSoundEffectsAndMerge(book Book, hash string, pageIndexes []int) {
 	if book.ContentHash == "" && hash != "" {
 		book.ContentHash = hash
 		db.Model(&Book{}).Where("id = ?", book.ID).Update("content_hash", hash)
 	}
-	// Ensure audio_path is set
 
-	if book.AudioPath == "" {
-		log.Printf("🚫 No audio_path set for book ID %d, skipping sound effects processing", book.ID)
-		return
-	}
-
-	// Ensure file exists
-	if _, err := os.Stat(book.FilePath); os.IsNotExist(err) {
-		log.Printf("🚫 File does not exist for book ID %d: %s", book.ID, book.FilePath)
-		return
-	}
-	// Ensure audio file exists
-	if _, err := os.Stat(book.AudioPath); os.IsNotExist(err) {
-		log.Printf("🚫 Audio file does not exist for book ID %d: %s", book.ID, book.AudioPath)
-		updateBookStatus(book.ID, "failed")
-		return
-	}
-	// Ensure content hash is set
-
-	if book.ContentHash == "" {
-		log.Println("⚠️ Book ContentHash is still empty — fallback reuse may not work properly")
-	}
-	// Check for existing processed audio with same content hash
-	var existing Book
-	err := db.Where("content_hash = ? AND audio_path IS NOT NULL AND status = 'completed'", book.ContentHash).First(&existing).Error
-	if err == nil {
-		log.Printf("🎵 Reusing audio from book ID %d for book ID %d", existing.ID, book.ID)
-		db.Model(&Book{}).Where("id = ?", book.ID).Updates(map[string]interface{}{
-			"audio_path": existing.AudioPath,
-			"status":     "completed (reused)",
-		})
-		return
-	}
-
-	// 1) Generate background music prompt
-	prompt, err := generateOverallSoundPrompt(book.FilePath)
-	if err != nil {
-		log.Printf("prompt err: %v", err)
-		updateBookStatus(book.ID, "failed")
-		return
-	}
-	bg, err := generateSoundEffect(prompt)
-	if err != nil {
-		log.Printf("music err: %v", err)
-		updateBookStatus(book.ID, "failed")
-		return
-	}
-
-	log.Printf("🎶 Background music generated: %s", bg)
-
-	// 2) Mix TTS with background
-	baseMix, err := mergeAudio(book.AudioPath, bg, book, book.FilePath, hash)
-	if err != nil {
-		log.Printf("mergeAudio err: %v", err)
-		updateBookStatus(book.ID, "failed")
-		return
-	}
-
-	// 3) Extract events and overlay
-	ttsDur, _ := getTTSDuration(book.AudioPath)
-	events, err := extractSoundEvents(book.FilePath, ttsDur)
-	if err != nil {
-		log.Printf("extractSoundEvents warning: %v", err)
-		book.AudioPath = baseMix
-	} else {
-		fxMix, err := overlaySoundEvents(baseMix, events, book)
-		if err != nil {
-			log.Printf("overlaySoundEvents warning: %v", err)
-			book.AudioPath = baseMix
-		} else {
-			book.AudioPath = fxMix
+	for _, idx := range pageIndexes {
+		var chunk BookChunk
+		if err := db.Where("book_id = ? AND \"index\" = ?", book.ID, idx).First(&chunk).Error; err != nil {
+			log.Printf("❌ Failed to load chunk index %d: %v", idx, err)
+			continue
 		}
-	}
 
-	// 4) Save and cleanup
-	if err := db.Model(&Book{}).Where("id = ?", book.ID).Updates(map[string]interface{}{
-		"audio_path": book.AudioPath,
-		"status":     "completed",
-	}).Error; err != nil {
-		log.Printf("db update err: %v", err)
-	} else {
-		log.Printf("✅ Book %d updated with audio_path → %s", book.ID, book.AudioPath)
+		// Ensure TTS audio file exists
+		if chunk.AudioPath == "" || !fileExists(chunk.AudioPath) {
+			log.Printf("🚫 No TTS audio found for chunk index %d: %s", idx, chunk.AudioPath)
+			continue
+		}
+
+		// Generate background music prompt
+		prompt, err := generateOverallSoundPrompt(book.FilePath)
+		if err != nil {
+			log.Printf("prompt err for chunk index %d: %v", idx, err)
+			continue
+		}
+
+		bg, err := generateSoundEffect(prompt)
+		if err != nil {
+			log.Printf("music err for chunk index %d: %v", idx, err)
+			continue
+		}
+
+		log.Printf("🎶 Background music generated: %s", bg)
+
+		// Mix audio
+		mixedPath, err := mergeAudio(chunk.AudioPath, bg, book, idx, book.FilePath, hash)
+		if err != nil {
+			log.Printf("mergeAudio err for page index %d: %v", idx, err)
+			continue
+		}
+
+		// Extract & overlay sound effects
+		ttsDur, _ := getTTSDuration(chunk.AudioPath)
+		events, err := extractSoundEvents(book.FilePath, ttsDur)
+		if err == nil {
+			fxPath, err := overlaySoundEvents(mixedPath, events, book, idx)
+			if err != nil {
+				log.Printf("⚠️ overlaySoundEvents failed for index %d: %v", idx, err)
+			} else {
+				log.Printf("✅ Sound effects overlayed: %s", fxPath)
+				mixedPath = fxPath // Use the new path with effects
+			}
+		}
+
+		// ✅ Update the final_audio_path for this chunk only
+		err = db.Model(&BookChunk{}).
+			Where("book_id = ? AND \"index\" = ?", book.ID, idx).
+			Update("final_audio_path", mixedPath).Error
+		if err != nil {
+			log.Printf("❌ Failed to update final_audio_path for book_id=%d page=%d: %v", book.ID, idx, err)
+		} else {
+			log.Printf("✅ Updated final_audio_path for book_id=%d page=%d → %s", book.ID, idx, mixedPath)
+		}
+
+		// Optional: delete temporary audio files here if needed
+		cleanupTempFiles(uint(book.ID))
 	}
-	cleanupTempFiles(book.ID)
 }
 
 // overlaySoundEvents updated to accept book
-func overlaySoundEvents(baseMix string, events EventMap, book Book) (string, error) {
+func overlaySoundEvents(baseMix string, events EventMap, book Book, pageIndex int) (string, error) {
 	safeTitle := strings.ReplaceAll(strings.ToLower(book.Title), " ", "_")
 	hashSuffix := book.ContentHash[:8]
-	outFile := fmt.Sprintf("./final_with_fx_%s_%d_%s.ogg", safeTitle, book.ID, hashSuffix)
+	outFile := fmt.Sprintf("./audio/final_with_fx_%s_%d_page_%d_%s.ogg", safeTitle, book.ID, pageIndex, hashSuffix)
 
 	args := []string{"-y", "-i", baseMix}
 	var filters, labels []string
@@ -523,4 +500,10 @@ func cleanupTempFiles(_ uint) {
 		os.Remove(file)
 	}
 	os.Remove("dyn_list.txt")
+}
+
+// adding helper function for file existence check
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

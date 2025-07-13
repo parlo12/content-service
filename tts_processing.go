@@ -230,10 +230,8 @@ func processBookConversion(book Book) {
 
 	// 6) Launch sound effects and merging in the background
 	log.Printf("🚀 Launching effects merge with hash: %s for book ID %d", book.ContentHash, book.ID)
-	go processSoundEffectsAndMerge(book, book.ContentHash)
+	go processSoundEffectsAndMerge(book, book.ContentHash, nil)
 }
-
-// adding this comment to check if my deployment works
 
 // updateBookStatus updates the status of a book in the database.
 func updateBookStatus(bookID uint, status string) {

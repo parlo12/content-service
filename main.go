@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -41,6 +42,7 @@ type Book struct {
 	UserID      uint   `gorm:"index"`
 	CoverPath   string // Optional cover image path
 	CoverURL    string // Optional cover image URL for public access
+	Index       int    // Index of the book in the list
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -55,16 +57,17 @@ type BookRequest struct {
 
 // Chunk represents the model for chunks or segments of boook
 type BookChunk struct {
-	ID        uint   `gorm:"primaryKey"`
-	BookID    uint   `gorm:"index"`
-	Index     int    // Index of the chunk in the book
-	Content   string `gorm:"type:text"` // Text content of the chunk
-	AudioPath string `gorm:"not null"`
-	TTSStatus string // values: "pending", "processing", "completed", "failed"
-	StartTime int64  // Start time in seconds
-	EndTime   int64  // End time in seconds
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID             uint   `gorm:"primaryKey"`
+	BookID         uint   `gorm:"index"`
+	Index          int    // Index of the chunk in the book
+	Content        string `gorm:"type:text"` // Text content of the chunk
+	AudioPath      string `gorm:"not null"`
+	FinalAudioPath string `json:"final_audio_path"` // 👈 New field
+	TTSStatus      string // values: "pending", "processing", "completed", "failed"
+	StartTime      int64  // Start time in seconds
+	EndTime        int64  // End time in seconds
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type TTSQueueJob struct {
@@ -105,28 +108,48 @@ func main() {
 	// Initialize Gin router.
 	router := gin.Default()
 
+	// ✅ Serve static audio files from ./audio
+	router.Static("/audio", "./audio")
+
 	// Calling Streaming Route outside of the authorized group
 	// router.GET("/user/books/stream/proxy/:id", proxyBookAudioHandler)
 
 	// Protected routes group.
 	authorized := router.Group("/user")
 	authorized.Use(authMiddleware())
-	{
+	{ // handles book creation, listing, and file uploads
+		// Create a new book
 		authorized.POST("/books", createBookHandler)
+		// List all books for the authenticated user
 		authorized.GET("/books", listBooksHandler)
+
+		// Upload a book file
 		authorized.POST("/books/upload", uploadBookFileHandler)
+		// List all chunks for a book
 		authorized.GET("/books/:book_id/chunks/pages", listBookPagesHandler) // New handler for listing book pages
 		// authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
+
 		authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
 		authorized.POST("/chunks/tts", ProcessChunksTTSHandler)
 		authorized.GET("/chunks/tts/merged-audio/:book_id", streamMergedChunkAudioHandler)
 		authorized.GET("/books/:book_id/chunks/:start/:end/audio", streamChunkGroupAudioHandler)
 		//authorized.GET("/chunks/status", checkChunkQueueStatusHandler)
 
+		//Batch Transcribe Book Page-by-Page (Sequentially)
+		authorized.POST("/books/:id/tts/batch", BatchTranscribeBookHandler)
 		// processing old chunks
 		authorized.GET("/books/:book_id/chunks/processed", listProcessedChunkGroupsHandler)
 		// stream audio by chunk IDs
 		authorized.POST("/chunks/audio-by-id", streamAudioByChunkIDsHandler)
+
+		// adding a new route to delate a book by ID or title
+		authorized.DELETE("/books/:id", deleteBookHandler)
+
+		// adding a new route to pull one book by ID
+		authorized.GET("/books/:book_id", getSingleBookHandler)
+
+		// adding a route to pull audio and backgrond music for a book
+		authorized.GET("/books/:book_id/pages/:page/audio", streamSinglePageAudioHandler)
 
 	}
 
@@ -211,6 +234,29 @@ func createBookHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Book saved", "book": book})
 }
 
+// deleteBookHandler deletes a book by its ID or title.
+
+func deleteBookHandler(c *gin.Context) {
+	bookID := c.Param("id")
+	if bookID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Book ID or title is required"})
+		return
+	}
+
+	var book Book
+	if err := db.First(&book, bookID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		return
+	}
+
+	if err := db.Delete(&book).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete book", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Book deleted successfully"})
+}
+
 // adding a new handler for listing book pages
 func listBookPagesHandler(c *gin.Context) {
 	bookID := c.Param("book_id")
@@ -266,10 +312,12 @@ func listBookPagesHandler(c *gin.Context) {
 			fullyProcessed = false
 		}
 		pages = append(pages, map[string]interface{}{
-			"page":      chunk.Index + 1,
-			"content":   chunk.Content,
-			"status":    chunk.TTSStatus,
-			"audio_url": chunk.AudioPath,
+			"page":    chunk.Index + 1,
+			"content": chunk.Content,
+			"status":  chunk.TTSStatus,
+			// "audio_url": chunk.AudioPath,
+			"audio_url": fmt.Sprintf("%s/user/books/%d/pages/%d/audio",
+				getEnv("STREAM_HOST", "http://localhost:8083"), chunk.BookID, chunk.Index),
 		})
 	}
 
@@ -413,6 +461,80 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
+func BatchTranscribeBookHandler(c *gin.Context) {
+	bookID := c.Param("id")
+
+	var chunks []BookChunk
+	if err := db.Where("book_id = ? AND tts_status != ?", bookID, "completed").Order("index ASC").Find(&chunks).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not fetch chunks"})
+		return
+	}
+
+	if len(chunks) == 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "Book already fully processed"})
+		return
+	}
+
+	go func() {
+		for _, chunk := range chunks {
+			db.Model(&chunk).Update("TTSStatus", "processing")
+
+			audioPath, err := convertTextToAudio(chunk.Content, chunk.ID)
+			if err != nil {
+				db.Model(&chunk).Update("TTSStatus", "failed")
+				continue
+			}
+
+			// Compute hash of the chunk content
+			hash := fmt.Sprintf("%x", sha256.Sum256([]byte(chunk.Content)))
+
+			// Load book info
+			var book Book
+			if err := db.First(&book, chunk.BookID).Error; err != nil {
+				log.Printf("Book not found for chunk %d: %v", chunk.ID, err)
+				continue
+			}
+
+			// Update book's Index temporarily for naming
+			book.Index = chunk.Index
+
+			// Generate background music and merge it
+			bgPrompt, err := generateOverallSoundPrompt(book.FilePath)
+			if err != nil {
+				log.Printf("Prompt generation failed: %v", err)
+				continue
+			}
+
+			bgMusic, err := generateSoundEffect(bgPrompt)
+			if err != nil {
+				log.Printf("Music generation failed: %v", err)
+				continue
+			}
+
+			mergedAudio, err := mergeAudio(audioPath, bgMusic, book, chunk.Index, book.FilePath, hash)
+			if err != nil {
+				log.Printf("Audio merge failed: %v", err)
+				continue
+			}
+
+			// Update the chunk's audio path
+			chunk.AudioPath = mergedAudio
+			chunk.TTSStatus = "completed"
+			db.Save(&chunk)
+		}
+
+		// Final status check
+		var remaining int64
+		db.Model(&BookChunk{}).Where("book_id = ? AND tts_status != ?", bookID, "completed").Count(&remaining)
+		if remaining == 0 {
+			db.Model(&Book{}).Where("id = ?", bookID).Update("status", "completed")
+			log.Printf("✅ Book %s fully transcribed", bookID)
+		}
+	}()
+
+	c.JSON(http.StatusAccepted, gin.H{"message": "Batch transcription started in background"})
+}
+
 func extractToken(authHeader string) (string, error) {
 	if authHeader == "" {
 		return "", errors.New("authorization header missing")
@@ -422,6 +544,47 @@ func extractToken(authHeader string) (string, error) {
 		return "", errors.New("authorization header format must be Bearer {token}")
 	}
 	return parts[1], nil
+}
+
+// getSingleBookHandler retrieves a single book by its ID.
+// getSingleBookHandler retrieves a single book by its ID.
+func getSingleBookHandler(c *gin.Context) {
+	bookID := c.Param("book_id")
+
+	if bookID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Book ID is required"})
+		return
+	}
+
+	var book Book
+	if err := db.First(&book, bookID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Book not found"})
+		return
+	}
+
+	// add full book data response
+	bookResponse := BookResponse{
+		ID:          book.ID,
+		Title:       book.Title,
+		Author:      book.Author,
+		Category:    book.Category,
+		Content:     book.Content,
+		ContentHash: book.ContentHash,
+		Genre:       book.Genre,
+		FilePath:    book.FilePath,
+		AudioPath:   book.AudioPath,
+		Status:      book.Status,
+	}
+
+	streamHost := getEnv("STREAM_HOST", "http://100.110.176.220:8083")
+	if streamHost == "" {
+		streamHost = "http://100.110.176.220:8083"
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"book": bookResponse,
+	})
+
 }
 
 func getEnv(key, fallback string) string {

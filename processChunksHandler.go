@@ -39,6 +39,7 @@ func ProcessChunksTTSHandler(c *gin.Context) {
 	// Process each chunk
 	var audioPaths []string
 	for _, chunk := range chunks {
+		pageIndex := chunk.Index + 1 // Convert to 1-based index for user-friendly messages
 		db.Model(&chunk).Update("TTSStatus", "processing")
 		audioPath, err := convertTextToAudio(chunk.Content, chunk.ID)
 		if err != nil {
@@ -49,10 +50,21 @@ func ProcessChunksTTSHandler(c *gin.Context) {
 		chunk.TTSStatus = "completed"
 		db.Save(&chunk)
 		audioPaths = append(audioPaths, audioPath)
+
+		// ✅ NEW: trigger the per-page final merge
+		book := Book{}
+		if err := db.First(&book, chunk.BookID).Error; err != nil {
+			log.Printf("failed to find book %d: %v", chunk.BookID, err)
+			continue
+		} else {
+			// Launch sound effects and merging in the background
+			log.Printf("🚀 Launching effects merge for book ID %d, chunk index %d", book.ID, pageIndex)
+			go processSoundEffectsAndMerge(book, book.ContentHash, []int{chunk.Index})
+		}
 	}
 
 	// Attempt to merge (optional)
-	err := processMergedChunks(req.BookID, extractIDs(chunks))
+	err := processMergedChunks(req.BookID)
 	if err != nil {
 		log.Printf("merge processing failed: %v", err)
 	}
@@ -61,6 +73,7 @@ func ProcessChunksTTSHandler(c *gin.Context) {
 		"message":     "TTS processing complete",
 		"audio_paths": audioPaths,
 	})
+
 }
 
 func toZeroBasedIndexes(pages []int) []int {
