@@ -11,10 +11,18 @@ export PGPASSWORD="$password"
 
 echo "Waiting for Postgres at $host:$port (user: $user)..."
 
-until psql "host=$host port=$port user=$user dbname=$dbname sslmode=require" -c '\q' > /dev/null 2>&1; do
-  echo "Postgres is unavailable - sleeping"
-  sleep 2
+attempt=0
+while true; do
+  if psql "host=$host port=$port user=$user dbname=$dbname sslmode=require" -c '\q'; then
+    echo "✅ Postgres is ready. Starting service..."
+    break
+  else
+    attempt=$((attempt+1))
+    echo "Attempt $attempt: Postgres is unavailable - sleeping"
+    sleep 2
+  fi
 done
 
-echo "✅ Postgres is ready. Starting service..."
+unset PGPASSWORD
+
 exec "$@"
