@@ -159,7 +159,7 @@ func main() {
 	}
 
 	// Use PORT env var if set; default to 8083.
-	port := os.Getenv("PORT")
+	port := os.Getenv("STREAM_HOST")
 	if port == "" {
 		port = "8083"
 	}
