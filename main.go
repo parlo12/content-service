@@ -108,6 +108,11 @@ func main() {
 	// Initialize Gin router.
 	router := gin.Default()
 
+	// Health check/root response
+	router.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"message": "Auth service is running at https://streamingaudioapp-h8npe.ondigitalocean.app"})
+	})
+
 	// ✅ Serve static audio files from ./audio
 	router.Static("/audio", "./audio")
 
