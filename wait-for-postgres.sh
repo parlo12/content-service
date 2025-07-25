@@ -23,6 +23,10 @@ while true; do
   fi
 done
 
-unset PGPASSWORD
+# Debug: confirm what will be executed
 
+echo "🚀 Launching app: $@"
+echo "----------------------------------------"
+
+unset PGPASSWORD
 exec "$@"
