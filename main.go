@@ -322,7 +322,7 @@ func listBookPagesHandler(c *gin.Context) {
 			"status":  chunk.TTSStatus,
 			// "audio_url": chunk.AudioPath,
 			"audio_url": fmt.Sprintf("%s/user/books/%d/pages/%d/audio",
-				getEnv("STREAM_HOST", "http://localhost:8083"), chunk.BookID, chunk.Index),
+				getEnv("STREAM_HOST", "http://0.0.0.0:8083"), chunk.BookID, chunk.Index),
 		})
 	}
 
