@@ -9,7 +9,7 @@ dbname="${DB_NAME}"
 
 export PGPASSWORD="$password"
 
-echo "Waiting for Postgres at $host:$port (user: $user)..."
+echo "🔄 Waiting for Postgres at $host:$port (user: $user)..."
 
 attempt=0
 while true; do

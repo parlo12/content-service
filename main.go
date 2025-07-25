@@ -109,9 +109,13 @@ func main() {
 	router := gin.Default()
 
 	// Health check/root response
-	router.GET("/", func(c *gin.Context) {
+	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"message": "Auth service is running at https://streamingaudioapp-h8npe.ondigitalocean.app"})
 	})
+
+	if err := router.Run(":8083"); err != nil {
+		log.Fatalf("❌ Failed to start server: %v", err)
+	}
 
 	// ✅ Serve static audio files from ./audio
 	router.Static("/audio", "./audio")
