@@ -18,7 +18,7 @@ jobs:
           port:      ${{ secrets.VM_SSH_PORT }}
           script: |
             set -e
-            cd /home/opc/streaming-app/content-service     # <— point inside your Git repo
+            cd ~/streaming-app   # ✅ Move to repo root
             git fetch origin main
             git reset --hard origin/main
 
