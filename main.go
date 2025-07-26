@@ -113,10 +113,6 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"message": "Auth service is running at https://streamingaudioapp-h8npe.ondigitalocean.app"})
 	})
 
-	if err := router.Run(":8083"); err != nil {
-		log.Fatalf("❌ Failed to start server: %v", err)
-	}
-
 	// ✅ Serve static audio files from ./audio
 	router.Static("/audio", "./audio")
 
@@ -168,7 +164,7 @@ func main() {
 		port = "8083"
 	}
 	log.Printf("Content service listening on port %s", port)
-	router.Run(":" + port)
+	//router.Run(":" + port)
 }
 
 // setupDatabase connects to PostgreSQL and auto migrates the Book model.
@@ -183,13 +179,15 @@ func setupDatabase() {
 		" password=" + dbPassword +
 		" dbname=" + dbName +
 		" port=" + dbPort +
-		" sslmode=reqire TimeZone=UTC"
+		" sslmode=require TimeZone=UTC"
 
 	var err error
 	db, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
+
+	log.Println("DNS", dsn)
 
 	if err := db.AutoMigrate(&Book{}, &BookChunk{}, &ProcessedChunkGroup{}, &TTSQueueJob{}); err != nil {
 		log.Fatalf("AutoMigrate failed: %v", err)
