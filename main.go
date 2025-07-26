@@ -159,12 +159,15 @@ func main() {
 	}
 
 	// Use PORT env var if set; default to 8083.
-	port := os.Getenv("STREAM_HOST")
+	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8083"
 	}
-	log.Printf("Content service listening on port %s", port)
+	log.Printf("📡 Content service listening on port %s", port)
 	//router.Run(":" + port)
+	if err := router.Run(":" + port); err != nil {
+		log.Fatalf("❌ Failed to start server: %v", err)
+	}
 }
 
 // setupDatabase connects to PostgreSQL and auto migrates the Book model.
