@@ -5,12 +5,13 @@ go 1.24.2
 require (
 	github.com/gin-gonic/gin v1.10.0
 	github.com/golang-jwt/jwt v3.2.2+incompatible
-	github.com/kapmahc/epub v0.1.1
 	gorm.io/driver/postgres v1.5.11
 	gorm.io/gorm v1.25.12
 	rsc.io/pdf v0.1.1
 
 )
+
+require github.com/lib/pq v1.10.9
 
 require (
 	github.com/bytedance/sonic v1.11.6 // indirect

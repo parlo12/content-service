@@ -10,6 +10,35 @@ import (
 // convertTextToAudio converts text to audio using OpenAI's TTS API.
 
 func ProcessChunksTTSHandler(c *gin.Context) {
+
+	authHeader := c.GetHeader("Authorization")
+	token, err := extractToken(authHeader)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing or invalid token"})
+		return
+	}
+
+	accountType, err := getUserAccountType(token)
+	if err != nil {
+		log.Printf("Error checking account type: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify account type"})
+		return
+	}
+
+	if accountType == "free" {
+		var completedChunks int64
+		userID := getUserIDFromContext(c)
+		db.Model(&BookChunk{}).
+			Joins("JOIN books ON books.id = book_chunks.book_id").
+			Where("book_chunks.tts_status = ? AND books.user_id = ?", "completed", userID).
+			Count(&completedChunks)
+
+		if completedChunks >= 1 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Free trial limit reached. Upgrade your plan to continue transcribing."})
+			return
+		}
+	}
+
 	var req struct {
 		BookID uint  `json:"book_id"`
 		Pages  []int `json:"pages"` // 1-based page numbers
@@ -64,9 +93,9 @@ func ProcessChunksTTSHandler(c *gin.Context) {
 	}
 
 	// Attempt to merge (optional)
-	err := processMergedChunks(req.BookID)
+	errs := processMergedChunks(req.BookID)
 	if err != nil {
-		log.Printf("merge processing failed: %v", err)
+		log.Printf("merge processing failed: %v", errs)
 	}
 
 	c.JSON(http.StatusOK, gin.H{

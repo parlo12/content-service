@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt"
 
+	_ "github.com/lib/pq"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -471,8 +473,68 @@ func authMiddleware() gin.HandlerFunc {
 	}
 }
 
+// adding helper function to get user account type
+
+func getUserAccountType(token string) (string, error) {
+	authServiceURL := getEnv("AUTH_SERVICE_URL", "http://auth-service:8082")
+
+	req, err := http.NewRequest("GET", authServiceURL+"/user/account-type", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("failed to fetch account type")
+	}
+
+	var result struct {
+		AccountType string `json:"account_type"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.AccountType, nil
+}
+
 func BatchTranscribeBookHandler(c *gin.Context) {
+
 	bookID := c.Param("id")
+
+	// Free account check begins here
+	authHeader := c.GetHeader("Authorization")
+	token, err := extractToken(authHeader)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Missing or invalid token"})
+		return
+	}
+
+	accountType, err := getUserAccountType(token)
+	if err != nil {
+		log.Printf("Error checking account type: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to verify account type"})
+		return
+	}
+
+	if accountType == "free" {
+		var completedChunks int64
+		db.Model(&BookChunk{}).
+			Joins("JOIN books ON books.id = book_chunks.book_id").
+			Where("book_chunks.tts_status = ? AND books.user_id = ?", "completed", getUserIDFromContext(c)).
+			Count(&completedChunks)
+
+		if completedChunks >= 1 {
+			c.JSON(http.StatusForbidden, gin.H{"error": "Free trial limit reached. Upgrade your plan to continue transcribing."})
+			return
+		}
+	}
 
 	var chunks []BookChunk
 	if err := db.Where("book_id = ? AND tts_status != ?", bookID, "completed").Order("index ASC").Find(&chunks).Error; err != nil {
@@ -543,6 +605,18 @@ func BatchTranscribeBookHandler(c *gin.Context) {
 	}()
 
 	c.JSON(http.StatusAccepted, gin.H{"message": "Batch transcription started in background"})
+}
+
+func getUserIDFromContext(c *gin.Context) uint {
+	claims, exists := c.Get("claims")
+	if !exists {
+		return 0
+	}
+	userClaims, ok := claims.(jwt.MapClaims)
+	if !ok {
+		return 0
+	}
+	return uint(userClaims["user_id"].(float64))
 }
 
 func extractToken(authHeader string) (string, error) {
