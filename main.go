@@ -476,7 +476,7 @@ func authMiddleware() gin.HandlerFunc {
 // adding helper function to get user account type
 
 func getUserAccountType(token string) (string, error) {
-	authServiceURL := getEnv("AUTH_SERVICE_URL", "http://auth-service:8082")
+	authServiceURL := getEnv("AUTH_SERVICE_URL", "https://streamingaudioapp-h8npe.ondigitalocean.app/")
 
 	req, err := http.NewRequest("GET", authServiceURL+"/user/account-type", nil)
 	if err != nil {
