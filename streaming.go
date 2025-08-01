@@ -10,7 +10,7 @@ import (
 )
 
 func proxyBookAudioHandler(c *gin.Context) {
-	bookID := c.Param("id")
+	bookID := c.Param("book_id")
 	tokenString := c.Query("token")
 
 	if tokenString == "" {

@@ -1,14 +1,18 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // StreamByChunkIDsRequest is the request payload for streaming by chunk IDs.
@@ -90,19 +94,42 @@ func startTTSWorker() {
 		go func() {
 			for {
 				var job TTSQueueJob
-				db.Where("status = ?", "queued").Order("created_at").First(&job)
-				if job.ID == 0 {
+				res := db.
+					Where("status = ?", "queued").
+					Order("created_at, id").
+					First(&job)
+
+				// No work to do right now
+				if errors.Is(res.Error, gorm.ErrRecordNotFound) {
 					time.Sleep(5 * time.Second)
 					continue
 				}
-				// chunkIDs := parseChunkIDs(job.ChunkIDs) // Removed unused variable
-				db.Model(&job).Update("status", "processing")
-				err := processMergedChunks(job.BookID)
-				if err != nil {
+				// Something went wrong talking to the DB
+				if res.Error != nil {
+					log.Printf("❌ error fetching queued TTS job: %v", res.Error)
+					time.Sleep(10 * time.Second)
+					continue
+				}
+
+				// Mark it in-flight
+				if err := db.Model(&job).Update("status", "processing").Error; err != nil {
+					log.Printf("❌ failed to mark job #%d processing: %v", job.ID, err)
+					// skip processing this one for now
+					time.Sleep(5 * time.Second)
+					continue
+				}
+
+				// Do the work
+				if err := processMergedChunks(job.BookID); err != nil {
+					log.Printf("❌ processing job #%d failed: %v", job.ID, err)
 					db.Model(&job).Update("status", "failed")
 					continue
 				}
-				db.Model(&job).Update("status", "complete")
+
+				// Finally, mark complete
+				if err := db.Model(&job).Update("status", "complete").Error; err != nil {
+					log.Printf("❌ failed to mark job #%d complete: %v", job.ID, err)
+				}
 			}
 		}()
 	})

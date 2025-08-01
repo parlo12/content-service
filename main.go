@@ -105,6 +105,9 @@ func main() {
 	// }
 	// Set up the database connection and run migrations.
 	setupDatabase()
+	// MQTT initialization
+	InitMQTT()
+	//Initializaton for TTS worker
 	startTTSWorker()
 
 	// Initialize Gin router.
@@ -118,6 +121,9 @@ func main() {
 	// ✅ Serve static audio files from ./audio
 	router.Static("/audio", "./audio")
 
+	// static cover files
+	router.Static("/covers", "./uploads/covers")
+
 	// Calling Streaming Route outside of the authorized group
 	// router.GET("/user/books/stream/proxy/:id", proxyBookAudioHandler)
 
@@ -125,6 +131,8 @@ func main() {
 	authorized := router.Group("/user")
 	authorized.Use(authMiddleware())
 	{ // handles book creation, listing, and file uploads
+		authorized.POST("/books/:book_id/cover", uploadBookCoverHandler)
+
 		// Create a new book
 		authorized.POST("/books", createBookHandler)
 		// List all books for the authenticated user
@@ -136,21 +144,21 @@ func main() {
 		authorized.GET("/books/:book_id/chunks/pages", listBookPagesHandler) // New handler for listing book pages
 		// authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
 
-		authorized.GET("/books/stream/proxy/:id", proxyBookAudioHandler)
+		authorized.GET("/books/stream/proxy/:book_id", proxyBookAudioHandler)
 		authorized.POST("/chunks/tts", ProcessChunksTTSHandler)
 		authorized.GET("/chunks/tts/merged-audio/:book_id", streamMergedChunkAudioHandler)
 		authorized.GET("/books/:book_id/chunks/:start/:end/audio", streamChunkGroupAudioHandler)
 		//authorized.GET("/chunks/status", checkChunkQueueStatusHandler)
 
 		//Batch Transcribe Book Page-by-Page (Sequentially)
-		authorized.POST("/books/:id/tts/batch", BatchTranscribeBookHandler)
+		authorized.POST("/books/:book_id/tts/batch", BatchTranscribeBookHandler)
 		// processing old chunks
 		authorized.GET("/books/:book_id/chunks/processed", listProcessedChunkGroupsHandler)
 		// stream audio by chunk IDs
 		authorized.POST("/chunks/audio-by-id", streamAudioByChunkIDsHandler)
 
 		// adding a new route to delate a book by ID or title
-		authorized.DELETE("/books/:id", deleteBookHandler)
+		authorized.DELETE("/books/:book_id", deleteBookHandler)
 
 		// adding a new route to pull one book by ID
 		authorized.GET("/books/:book_id", getSingleBookHandler)
@@ -163,9 +171,11 @@ func main() {
 	// Use PORT env var if set; default to 8083.
 	port := os.Getenv("PORT")
 	if port == "" {
+
 		port = "8083"
 	}
 	log.Printf("📡 Content service listening on port %s", port)
+
 	//router.Run(":" + port)
 	if err := router.Run(":" + port); err != nil {
 		log.Fatalf("❌ Failed to start server: %v", err)
@@ -249,7 +259,7 @@ func createBookHandler(c *gin.Context) {
 // deleteBookHandler deletes a book by its ID or title.
 
 func deleteBookHandler(c *gin.Context) {
-	bookID := c.Param("id")
+	bookID := c.Param("book_id")
 	if bookID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Book ID or title is required"})
 		return
@@ -476,7 +486,7 @@ func authMiddleware() gin.HandlerFunc {
 // adding helper function to get user account type
 
 func getUserAccountType(token string) (string, error) {
-	authServiceURL := getEnv("AUTH_SERVICE_URL", "https://streamingaudioapp-h8npe.ondigitalocean.app")
+	authServiceURL := getEnv("AUTH_SERVICE_URL", "http//content-service:8083")
 
 	req, err := http.NewRequest("GET", authServiceURL+"/user/account-type", nil)
 	if err != nil {
@@ -506,7 +516,7 @@ func getUserAccountType(token string) (string, error) {
 
 func BatchTranscribeBookHandler(c *gin.Context) {
 
-	bookID := c.Param("id")
+	bookID := c.Param("book_id")
 
 	// Free account check begins here
 	authHeader := c.GetHeader("Authorization")
