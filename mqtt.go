@@ -16,7 +16,7 @@ var mqttClient mqtt.Client
 
 // InitMQTT initializes and connects the MQTT client.
 func InitMQTT() {
-	broker := getEnv("MQTT_BROKER", "tls://content-service-9ncuf.ondigitalocean.app:8883")
+	broker := getEnv("MQTT_BROKER", "tls://mqtt-broker:1883")
 	clientID := fmt.Sprintf("svc-content-%d", time.Now().UnixNano())
 
 	opts := mqtt.NewClientOptions().
